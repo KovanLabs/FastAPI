@@ -1,86 +1,79 @@
-from decimal import Decimal 
-from enum import StrEnum   
+from contextlib import asynccontextmanager
+from time import perf_counter
+from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query, status
-from pydantic import BaseModel, EmailStr, Field 
- 
-app = FastAPI(title="Vendor Order Import API") 
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-class OrderStatus(StrEnum): 
-    pending = "pending" 
-    completed = "completed" 
-    cancelled = "cancelled" 
-
-
-class OrderItem(BaseModel): 
-    sku: str = Field(min_length=1, max_length=80) 
-    quantity: int = Field(gt=0, le=10_000) 
+from app.api.orders import router
+from app.core.config import get_settings
+from app.core.exceptions import ApplicationError
 
 
-class OrderCreate(BaseModel): 
-    order_id: str = Field(min_length=1, max_length=100) 
-    customer_email: EmailStr 
-    amount: Decimal = Field(gt=0) 
-    currency: str = Field(min_length=3, max_length=3) 
-    status: OrderStatus 
-    items: list[OrderItem] = Field(min_length=1) 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    settings.upload_directory.mkdir(parents=True, exist_ok=True)
+    settings.output_directory.mkdir(parents=True, exist_ok=True)
+    yield
 
 
-class ShippingAddress(BaseModel):
-    street: str = Field(min_length=1, max_length=200)
-    city: str = Field(min_length=1, max_length=80)
-    postal_code: str = Field(min_length=3, max_length=12)
-    country: str = Field(min_length=2, max_length=2)
+app = FastAPI(
+    title=get_settings().app_name,
+    version="0.2.0",
+    lifespan=lifespan,
+)
+app.include_router(router)
 
 
-class OrderResponse(OrderCreate): 
-    accepted: bool = True 
-ORDERS: dict[str, OrderResponse] = {} 
+class RequestContextMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        incoming_headers = dict(scope.get("headers", []))
+        request_id = incoming_headers.get(b"x-request-id", b"").decode("latin-1")
+        request_id = request_id or f"req_{uuid4().hex}"
+        scope.setdefault("state", {})["request_id"] = request_id
+        started = perf_counter()
+
+        async def add_response_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["X-Process-Time"] = f"{perf_counter() - started:.6f}"
+                headers["X-Request-ID"] = request_id
+            await send(message)
+
+        await self.app(scope, receive, add_response_headers)
 
 
-class CheckoutOrderRequest(BaseModel):
-    customer_email: EmailStr
-    currency: str = Field(min_length=3, max_length=3)
-    shipping_address: ShippingAddress
-    items: list[OrderItem] = Field(min_length=1)
+app.add_middleware(RequestContextMiddleware)
 
 
-@app.get("/health/live") 
-def liveness() -> dict[str, str]: 
-    return {"status": "ok"} 
-
-@app.post( 
-    "/orders", 
-    response_model=OrderResponse, 
-    status_code=status.HTTP_201_CREATED, 
-) 
-def create_order(order: OrderCreate) -> OrderResponse: 
-    if order.order_id in ORDERS: 
-        raise HTTPException(status_code=409, detail="Order already exists") 
-    response = OrderResponse(**order.model_dump()) 
-    ORDERS[order.order_id] = response 
-    return response 
-
-@app.get("/orders/{order_id}", response_model=OrderResponse) 
-def get_order(order_id: str) -> OrderResponse: 
-    order = ORDERS.get(order_id) 
-    if order is None: 
-        raise HTTPException(status_code=404, detail="Order not found") 
-    return order 
-
-@app.get("/orders", response_model=list[OrderResponse]) 
-def list_orders( 
-    order_status: OrderStatus | None = Query(default=None, alias="status"), 
-) -> list[OrderResponse]: 
-
-    values = list(ORDERS.values()) 
-    if order_status is None: 
-        return values 
-    return [order for order in values if order.status == order_status] 
-
-@app.post(
-    "/orders/checkout",
-    response_model=CheckoutOrderRequest,
-    status_code=status.HTTP_201_CREATED,)
-def create_checkout_order(payload: CheckoutOrderRequest):
-    return payload
+@app.exception_handler(ApplicationError)
+async def application_error_handler(
+    request: Request,
+    exc: ApplicationError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.error_code,
+                "message": exc.message,
+                "details": exc.details,
+            },
+            "request_id": request.state.request_id,
+        },
+    )
