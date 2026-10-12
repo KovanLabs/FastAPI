@@ -66,11 +66,6 @@ class ImportNotFoundError(ApplicationError):
     status_code = 404
 
 
-class ImportNotReadyError(ApplicationError):
-    error_code = "import_not_ready"
-    status_code = 409
-
-
 class StorageDirectoryUnavailableError(ApplicationError):
     error_code = "storage_directory_unavailable"
     status_code = 503

@@ -2,21 +2,16 @@
 
 from __future__ import annotations
 
-import json
-import os
-import sqlite3
-import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import BinaryIO, TextIO, TypeVar
+from typing import BinaryIO, TypeVar
 
 import ijson
 import polars as pl
 from pydantic import TypeAdapter, ValidationError
 
-from app.core.order_cleaning import CleaningIssue, clean_order
 from app.core.parsers import InvalidJsonError
 from app.schemas.orders import OrderCreate
 
@@ -26,7 +21,7 @@ T = TypeVar("T")
 
 @dataclass(frozen=True)
 class ValidationIssue:
-    location: tuple[str | int, ...]
+    location: str
     message: str
     error_type: str
 
@@ -57,469 +52,6 @@ class OrderPipelineSummary:
     rejected_records: int
     failures_by_code: dict[str, int]
     failure_samples: list[dict[str, object]]
-
-
-@dataclass(frozen=True)
-class OrderImportSummary:
-    """Auditable counts produced by a completed two-pass order import."""
-
-    total_records: int
-    accepted_records: int
-    rejected_records: int
-    failures_by_code: dict[str, int]
-    failure_samples: list[dict[str, object]]
-    duplicate_index_backend: str
-    sqlite_working_store_bytes: int
-
-    def __post_init__(self) -> None:
-        if self.total_records != self.accepted_records + self.rejected_records:
-            raise ValueError("Order import counts do not reconcile")
-
-
-def validate_order_business(
-    order: OrderCreate,
-    supported_currencies: Iterable[str],
-) -> tuple[ValidationIssue, ...]:
-    """Apply project business policy after Pydantic schema validation."""
-    supported = frozenset(currency.upper() for currency in supported_currencies)
-    return _business_issues(order, supported)
-
-
-def _business_issues(
-    order: OrderCreate,
-    supported_currencies: frozenset[str],
-) -> tuple[ValidationIssue, ...]:
-    if order.currency in supported_currencies:
-        return ()
-    return (
-        ValidationIssue(
-            location=("currency",),
-            message=f"currency {order.currency!r} is not supported",
-            error_type="unsupported_currency",
-        ),
-    )
-
-
-def process_order_file(
-    input_path: Path,
-    *,
-    accepted_path: Path,
-    rejected_path: Path,
-    supported_currencies: Iterable[str],
-    maximum_failure_samples: int = 20,
-    commit_interval: int = 5_000,
-) -> OrderImportSummary:
-    """Validate a JSON order array and publish two NDJSON files with rollback.
-
-    Pass one incrementally parses, cleans, validates, and records decisions in a
-    temporary SQLite database. The winners table is updated only by valid
-    records, so the last valid occurrence of each canonical order ID wins.
-    Pass two walks the recorded decisions in input order and writes bounded,
-    deterministic accepted and rejected NDJSON streams.
-    """
-    if maximum_failure_samples < 0:
-        raise ValueError("maximum_failure_samples must not be negative")
-    if commit_interval <= 0:
-        raise ValueError("commit_interval must be positive")
-    if accepted_path == rejected_path:
-        raise ValueError("accepted_path and rejected_path must be different")
-
-    accepted_path.parent.mkdir(parents=True, exist_ok=True)
-    rejected_path.parent.mkdir(parents=True, exist_ok=True)
-    supported = frozenset(currency.upper() for currency in supported_currencies)
-    adapter = TypeAdapter(OrderCreate)
-
-    database_handle, database_name = tempfile.mkstemp(
-        prefix=".order-import-",
-        suffix=".sqlite3",
-        dir=accepted_path.parent,
-    )
-    os.close(database_handle)
-    database_path = Path(database_name)
-
-    try:
-        with sqlite3.connect(database_path) as connection:
-            _create_import_tables(connection)
-            total_records = _stage_order_records(
-                connection,
-                input_path,
-                adapter=adapter,
-                supported_currencies=supported,
-                commit_interval=commit_interval,
-            )
-            sqlite_working_store_bytes = _sqlite_size_bytes(connection)
-            (
-                accepted_records,
-                rejected_records,
-                failures_by_code,
-                failure_samples,
-            ) = _publish_order_outputs(
-                connection,
-                accepted_path=accepted_path,
-                rejected_path=rejected_path,
-                maximum_failure_samples=maximum_failure_samples,
-            )
-    finally:
-        database_path.unlink(missing_ok=True)
-
-    return OrderImportSummary(
-        total_records=total_records,
-        accepted_records=accepted_records,
-        rejected_records=rejected_records,
-        failures_by_code=failures_by_code,
-        failure_samples=failure_samples,
-        duplicate_index_backend="sqlite",
-        sqlite_working_store_bytes=sqlite_working_store_bytes,
-    )
-
-
-def _create_import_tables(connection: sqlite3.Connection) -> None:
-    connection.executescript(
-        """
-        CREATE TABLE records (
-            record_number INTEGER PRIMARY KEY,
-            order_id TEXT,
-            accepted_json TEXT,
-            rejected_json TEXT
-        );
-        CREATE TABLE winners (
-            order_id TEXT PRIMARY KEY,
-            record_number INTEGER NOT NULL
-        );
-        """
-    )
-
-
-def _stage_order_records(
-    connection: sqlite3.Connection,
-    input_path: Path,
-    *,
-    adapter: TypeAdapter[OrderCreate],
-    supported_currencies: frozenset[str],
-    commit_interval: int,
-) -> int:
-    total_records = 0
-    with input_path.open("rb") as source:
-        for record_number, raw in enumerate(iter_ijson_array(source), start=1):
-            total_records = record_number
-            order_id: str | None = None
-            accepted_json: str | None = None
-            rejected_json: str | None = None
-
-            if not isinstance(raw, dict):
-                rejected_json = _rejection_json(record_number, "not_object", ())
-            else:
-                cleaning = clean_order(raw)
-                if cleaning.issues:
-                    rejected_json = _rejection_json(
-                        record_number,
-                        "cleaning_failed",
-                        cleaning.issues,
-                    )
-                else:
-                    try:
-                        order = adapter.validate_python(cleaning.value)
-                    except ValidationError as exc:
-                        rejected_json = _schema_rejection_json(record_number, exc)
-                    else:
-                        business_issues = _business_issues(
-                            order,
-                            supported_currencies,
-                        )
-                        if business_issues:
-                            rejected_json = _rejection_json(
-                                record_number,
-                                "unsupported_currency",
-                                business_issues,
-                            )
-                        else:
-                            order_id = order.order_id
-                            accepted_json = _accepted_json(record_number, order)
-
-            connection.execute(
-                """
-                INSERT INTO records(
-                    record_number, order_id, accepted_json, rejected_json
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (record_number, order_id, accepted_json, rejected_json),
-            )
-            if order_id is not None:
-                connection.execute(
-                    """
-                    INSERT INTO winners(order_id, record_number)
-                    VALUES (?, ?)
-                    ON CONFLICT(order_id) DO UPDATE
-                    SET record_number = excluded.record_number
-                    """,
-                    (order_id, record_number),
-                )
-            if record_number % commit_interval == 0:
-                connection.commit()
-    connection.commit()
-    return total_records
-
-
-def _publish_order_outputs(
-    connection: sqlite3.Connection,
-    *,
-    accepted_path: Path,
-    rejected_path: Path,
-    maximum_failure_samples: int,
-) -> tuple[int, int, dict[str, int], list[dict[str, object]]]:
-    accepted_temporary = _temporary_output_path(accepted_path)
-    rejected_temporary = _temporary_output_path(rejected_path)
-    accepted_records = 0
-    rejected_records = 0
-    failures_by_code: dict[str, int] = {}
-    failure_samples: list[dict[str, object]] = []
-
-    try:
-        with (
-            accepted_temporary.open("x", encoding="utf-8", newline="\n") as accepted,
-            rejected_temporary.open("x", encoding="utf-8", newline="\n") as rejected,
-        ):
-            rows = connection.execute(
-                """
-                SELECT
-                    records.record_number,
-                    records.order_id,
-                    records.accepted_json,
-                    records.rejected_json,
-                    winners.record_number
-                FROM records
-                LEFT JOIN winners ON winners.order_id = records.order_id
-                ORDER BY records.record_number
-                """
-            )
-            for record_number, order_id, accepted_json, rejected_json, winner in rows:
-                if rejected_json is not None:
-                    rejection = json.loads(rejected_json)
-                    _write_ndjson_line(rejected, rejection)
-                    rejected_records += 1
-                    _record_failure(
-                        rejection,
-                        failures_by_code,
-                        failure_samples,
-                        maximum_failure_samples=maximum_failure_samples,
-                    )
-                elif record_number == winner:
-                    accepted.write(accepted_json)
-                    accepted.write("\n")
-                    accepted_records += 1
-                else:
-                    rejection = {
-                        "record_number": record_number,
-                        "error_code": "duplicate_order_id",
-                        "issues": [
-                            {
-                                "code": "duplicate_order_id",
-                                "location": ["order_id"],
-                                "message": (
-                                    "A later valid record with canonical order_id "
-                                    f"{order_id!r} wins this import."
-                                ),
-                            }
-                        ],
-                    }
-                    _write_ndjson_line(rejected, rejection)
-                    rejected_records += 1
-                    _record_failure(
-                        rejection,
-                        failures_by_code,
-                        failure_samples,
-                        maximum_failure_samples=maximum_failure_samples,
-                    )
-
-            accepted.flush()
-            rejected.flush()
-            os.fsync(accepted.fileno())
-            os.fsync(rejected.fileno())
-
-        _publish_output_pair(
-            (
-                (accepted_temporary, accepted_path),
-                (rejected_temporary, rejected_path),
-            )
-        )
-    except BaseException:
-        accepted_temporary.unlink(missing_ok=True)
-        rejected_temporary.unlink(missing_ok=True)
-        raise
-
-    return (
-        accepted_records,
-        rejected_records,
-        failures_by_code,
-        failure_samples,
-    )
-
-
-def _temporary_output_path(destination: Path) -> Path:
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".part",
-        dir=destination.parent,
-    )
-    os.close(descriptor)
-    path = Path(name)
-    path.unlink()
-    return path
-
-
-def _publish_output_pair(outputs: tuple[tuple[Path, Path], ...]) -> None:
-    """Publish outputs together and restore prior files after an I/O failure.
-
-    Each individual replacement is atomic. The rollback protects against a
-    normal exception between replacements; no two-path operation can guarantee
-    atomicity across an abrupt process or machine failure.
-    """
-    backups: list[tuple[Path, Path | None]] = []
-    published: list[Path] = []
-    try:
-        for _, destination in outputs:
-            if destination.exists():
-                backup = _temporary_backup_path(destination)
-                os.replace(destination, backup)
-                backups.append((destination, backup))
-            else:
-                backups.append((destination, None))
-
-        for temporary, destination in outputs:
-            os.replace(temporary, destination)
-            published.append(destination)
-    except BaseException:
-        for destination in published:
-            destination.unlink(missing_ok=True)
-        for destination, backup in backups:
-            if backup is not None and backup.exists():
-                os.replace(backup, destination)
-        raise
-    else:
-        for _, backup in backups:
-            if backup is not None:
-                try:
-                    backup.unlink(missing_ok=True)
-                except OSError:
-                    # Both final files are already valid. A cleanup failure must
-                    # not report the completed import as failed.
-                    pass
-
-
-def _temporary_backup_path(destination: Path) -> Path:
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{destination.name}.",
-        suffix=".backup",
-        dir=destination.parent,
-    )
-    os.close(descriptor)
-    path = Path(name)
-    path.unlink()
-    return path
-
-
-def _accepted_json(record_number: int, order: OrderCreate) -> str:
-    return json.dumps(
-        {
-            "record_number": record_number,
-            "order": json.loads(order.model_dump_json()),
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _schema_rejection_json(record_number: int, error: ValidationError) -> str:
-    issues = [
-        {
-            "code": _schema_issue_code(tuple(detail["loc"])),
-            "location": list(detail["loc"]),
-            "message": "Value does not satisfy the order schema.",
-        }
-        for detail in error.errors(include_input=False, include_url=False)
-    ]
-    return _json_text(
-        {
-            "record_number": record_number,
-            "error_code": "invalid_order",
-            "issues": issues,
-        }
-    )
-
-
-def _schema_issue_code(location: tuple[str | int, ...]) -> str:
-    if location[:1] == ("customer_email",):
-        return "invalid_email"
-    if location[:1] == ("amount",):
-        return "invalid_amount"
-    if location[:1] == ("ordered_at",):
-        return "invalid_datetime"
-    if location[:1] == ("status",):
-        return "invalid_status"
-    if location[:1] == ("currency",):
-        return "invalid_currency"
-    if location[:1] == ("order_id",):
-        return "invalid_order_id"
-    if location[-1:] == ("sku",):
-        return "invalid_sku"
-    if location[-1:] == ("quantity",):
-        return "invalid_quantity"
-    if location[:1] == ("items",):
-        return "invalid_items"
-    return "invalid_order"
-
-
-def _rejection_json(
-    record_number: int,
-    error_code: str,
-    issues: Iterable[CleaningIssue | ValidationIssue],
-) -> str:
-    return _json_text(
-        {
-            "record_number": record_number,
-            "error_code": error_code,
-            "issues": [
-                {
-                    "code": (
-                        issue.code
-                        if isinstance(issue, CleaningIssue)
-                        else issue.error_type
-                    ),
-                    "location": list(issue.location),
-                    "message": issue.message,
-                }
-                for issue in issues
-            ],
-        }
-    )
-
-
-def _json_text(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _write_ndjson_line(destination: TextIO, value: object) -> None:
-    destination.write(_json_text(value))
-    destination.write("\n")
-
-
-def _record_failure(
-    rejection: dict[str, object],
-    failures_by_code: dict[str, int],
-    failure_samples: list[dict[str, object]],
-    *,
-    maximum_failure_samples: int,
-) -> None:
-    code = str(rejection["error_code"])
-    failures_by_code[code] = failures_by_code.get(code, 0) + 1
-    if len(failure_samples) < maximum_failure_samples:
-        failure_samples.append(rejection)
-
-
-def _sqlite_size_bytes(connection: sqlite3.Connection) -> int:
-    page_count = int(connection.execute("PRAGMA page_count").fetchone()[0])
-    page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
-    return page_count * page_size
 
 
 def iter_ijson_array(
@@ -564,7 +96,7 @@ def iter_batches(records: Iterable[T], *, batch_size: int) -> Iterator[list[T]]:
 def clean_order_batch(
     records: Sequence[tuple[int, dict[str, object]]],
 ) -> list[CleanedOrder]:
-    """Legacy Day 4 Polars benchmark; use ``process_order_file`` for Day 5."""
+    """Normalize scalar order fields with Polars inside one bounded batch."""
     if not records:
         return []
 
@@ -634,7 +166,7 @@ def iter_order_outcomes(
     batch_size: int,
     supported_currencies: Iterable[str],
 ) -> Iterator[OrderProcessingOutcome]:
-    """Legacy Day 4 iterator; it does not implement the Day 5 contract."""
+    """Parse, clean, and validate orders while retaining only one batch."""
     supported = frozenset(supported_currencies)
     adapter = TypeAdapter(OrderCreate)
     numbered = enumerate(iter_ijson_array(source), start=1)
@@ -674,7 +206,7 @@ def iter_order_outcomes(
                     error_code="invalid_order",
                     issues=tuple(
                         ValidationIssue(
-                            location=tuple(error["loc"]),
+                            location=".".join(str(part) for part in error["loc"]),
                             message=error["msg"],
                             error_type=error["type"],
                         )
@@ -703,7 +235,7 @@ def summarize_order_file(
     supported_currencies: Iterable[str],
     maximum_failure_samples: int = 20,
 ) -> OrderPipelineSummary:
-    """Summarize the legacy Day 4 iterator; not the canonical Day 5 import."""
+    """Process one file and retain only counters plus bounded failure samples."""
     if maximum_failure_samples < 0:
         raise ValueError("maximum_failure_samples must not be negative")
 

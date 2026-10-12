@@ -1,3 +1,0 @@
-{"record_number":1,"error_code":"duplicate_order_id","issues":[{"code":"duplicate_order_id","location":["order_id"],"message":"A later valid record with canonical order_id 'GOLD-1' wins this import."}]}
-{"record_number":2,"error_code":"cleaning_failed","issues":[{"code":"blank_not_allowed","location":["customer_email"],"message":"customer_email cannot be blank."}]}
-{"record_number":4,"error_code":"unsupported_currency","issues":[{"code":"unsupported_currency","location":["currency"],"message":"currency 'GBP' is not supported"}]}

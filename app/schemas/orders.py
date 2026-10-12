@@ -6,9 +6,6 @@ from typing import Annotated
 from pydantic import BaseModel, EmailStr, Field, StringConstraints
 
 
-MAX_ITEMS_PER_ORDER = 1_000
-
-
 class OrderStatus(StrEnum):
     pending = "pending"
     completed = "completed"
@@ -33,10 +30,7 @@ class OrderCreate(BaseModel):
     currency: str = Field(min_length=3, max_length=3)
     ordered_at: datetime
     status: OrderStatus
-    items: list[OrderItem] = Field(
-        min_length=1,
-        max_length=MAX_ITEMS_PER_ORDER,
-    )
+    items: list[OrderItem] = Field(min_length=1)
 
 
 class ShippingAddress(BaseModel):
@@ -54,7 +48,4 @@ class CheckoutOrderRequest(BaseModel):
     customer_email: EmailStr
     currency: str = Field(min_length=3, max_length=3)
     shipping_address: ShippingAddress
-    items: list[OrderItem] = Field(
-        min_length=1,
-        max_length=MAX_ITEMS_PER_ORDER,
-    )
+    items: list[OrderItem] = Field(min_length=1)

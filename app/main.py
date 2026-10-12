@@ -1,5 +1,4 @@
 from contextlib import asynccontextmanager
-from threading import Lock
 from time import perf_counter
 from uuid import uuid4
 
@@ -11,7 +10,6 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.api.orders import router
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
-from app.core.import_jobs import InMemoryImportJobRepository
 
 
 @asynccontextmanager
@@ -19,8 +17,6 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     settings.upload_directory.mkdir(parents=True, exist_ok=True)
     settings.output_directory.mkdir(parents=True, exist_ok=True)
-    app.state.import_job_repository = InMemoryImportJobRepository()
-    app.state.import_writer_lock = Lock()
     yield
 
 
