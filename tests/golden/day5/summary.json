@@ -1,0 +1,10 @@
+{
+  "total_records": 4,
+  "accepted_records": 1,
+  "rejected_records": 3,
+  "failures_by_code": {
+    "duplicate_order_id": 1,
+    "cleaning_failed": 1,
+    "unsupported_currency": 1
+  }
+}

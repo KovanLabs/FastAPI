@@ -1,11 +1,13 @@
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings, get_settings
+from app.core.import_jobs import ImportState
 from app.main import app
 
 @pytest.fixture(autouse=True)
@@ -38,9 +40,18 @@ def client(override_test_settings):
 NDJSON_BODY = "\n".join(
     json.dumps(record)
     for record in [
-        {"order_id": "ORD-1001", "amount": "1299.50", "currency": "INR"},
-        {"order_id": "ORD-1002", "amount": "445.00", "currency": "USD"},
-        {},
+        {
+            "record_number": 1,
+            "order": {
+                "order_id": "ORD-1001",
+                "customer_email": "buyer@example.com",
+                "amount": "1299.50",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [{"sku": "SKU-1", "quantity": 1}],
+            },
+        },
     ]
 ) + "\n"
 
@@ -62,6 +73,143 @@ def test_import_stores_multipart_upload_and_returns_accepted_metadata(override_t
     assert stored.exists()
     assert stored.read_bytes() == NDJSON_BODY.encode()
     assert list(override_test_settings.upload_directory.glob("*.part")) == []
+
+    status_response = client.get(f"/imports/{body['import_id']}")
+    assert status_response.status_code == 200
+    assert status_response.json()["state"] == "completed"
+
+    summary_response = client.get(f"/imports/{body['import_id']}/summary")
+    assert summary_response.status_code == 200
+    assert summary_response.json()["accepted_records"] == 1
+
+
+def test_import_status_reports_the_completed_background_job(client) -> None:
+    response = client.post(
+        "/imports",
+        files={"file": ("orders.json", b"[]", "application/json")},
+    )
+    import_id = response.json()["import_id"]
+
+    status_response = client.get(f"/imports/{import_id}")
+
+    assert status_response.status_code == 200
+    body = status_response.json()
+    created_at = datetime.fromisoformat(body.pop("created_at"))
+    updated_at = datetime.fromisoformat(body.pop("updated_at"))
+    assert created_at <= updated_at
+    assert body == {
+        "import_id": import_id,
+        "state": "completed",
+        "bytes_received": 2,
+        "total_records": 0,
+        "accepted_records": 0,
+        "rejected_records": 0,
+        "failure_code": None,
+        "failure_message": None,
+    }
+
+
+def test_canonical_import_over_the_record_limit_becomes_a_failed_job(
+    override_test_settings,
+    client,
+) -> None:
+    override_test_settings.maximum_record_bytes = 100
+
+    response = client.post(
+        "/imports",
+        files={
+            "file": (
+                "orders.ndjson",
+                NDJSON_BODY.encode(),
+                "application/x-ndjson",
+            )
+        },
+    )
+    import_id = response.json()["import_id"]
+
+    status_response = client.get(f"/imports/{import_id}")
+
+    assert response.status_code == 202
+    assert status_response.json()["state"] == "failed"
+    assert status_response.json()["failure_code"] == "processing_failed"
+
+
+def test_import_summary_and_errors_report_a_completed_json_import(client) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": "ORD-1",
+                "customer_email": "user@example.com",
+                "amount": "10.00",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [{"sku": "SKU-1", "quantity": 1}],
+            },
+            {"order_id": "missing-required-fields"},
+        ]
+    ).encode()
+    response = client.post(
+        "/imports",
+        files={"file": ("orders.json", payload, "application/json")},
+    )
+    import_id = response.json()["import_id"]
+
+    summary_response = client.get(f"/imports/{import_id}/summary")
+    errors_response = client.get(f"/imports/{import_id}/errors?limit=1")
+
+    assert summary_response.status_code == 200
+    assert summary_response.json() == {
+        "import_id": import_id,
+        "state": "completed_with_errors",
+        "total_records": 2,
+        "accepted_records": 1,
+        "rejected_records": 1,
+        "failures_by_code": {"cleaning_failed": 1},
+    }
+    assert errors_response.status_code == 200
+    assert errors_response.json()["import_id"] == import_id
+    assert errors_response.json()["total_errors"] == 1
+    assert errors_response.json()["returned_errors"] == 1
+    assert errors_response.json()["errors"][0]["record_number"] == 2
+    assert errors_response.json()["errors"][0]["error_code"] == "cleaning_failed"
+
+
+def test_import_status_returns_structured_not_found(client) -> None:
+    response = client.get("/imports/missing-import")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "import_not_found"
+
+
+def test_import_artifacts_are_hidden_until_the_job_is_terminal(
+    override_test_settings,
+    client,
+) -> None:
+    repository = app.state.import_job_repository
+    repository.create(
+        import_id="in-progress",
+        stored_filename="in-progress.json",
+        checksum="abc123",
+        bytes_received=42,
+    )
+    repository.transition("in-progress", ImportState.queued)
+    repository.transition("in-progress", ImportState.processing)
+    job_directory = override_test_settings.output_directory / "in-progress"
+    job_directory.mkdir(parents=True)
+    (job_directory / "summary.json").write_text(
+        '{"failures_by_code":{}}\n',
+        encoding="utf-8",
+    )
+    (job_directory / "rejected.ndjson").write_text("", encoding="utf-8")
+
+    summary = client.get("/imports/in-progress/summary")
+    errors = client.get("/imports/in-progress/errors")
+
+    assert summary.status_code == 409
+    assert summary.json()["error"]["code"] == "import_not_ready"
+    assert errors.status_code == 409
+    assert errors.json()["error"]["code"] == "import_not_ready"
 
 
 def test_import_rejects_wrong_content_type(client) -> None:

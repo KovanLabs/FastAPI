@@ -1,19 +1,39 @@
 import asyncio
+import json
 
-from fastapi import APIRouter, File, Query, UploadFile, status
+from pathlib import Path
+from _thread import LockType
 
-from app.api.dependencies import OrderValidationServiceDependency, SettingsDependency
+from fastapi import APIRouter, BackgroundTasks, File, Query, UploadFile, status
+
+from app.api.dependencies import (
+    ImportJobRepositoryDependency,
+    ImportWriterLockDependency,
+    OrderValidationServiceDependency,
+    SettingsDependency,
+)
 from app.core.exceptions import (
+    ImportNotFoundError,
+    ImportNotReadyError,
     OrderAlreadyExistsError,
     OrderNotFoundError,
     StorageDirectoryUnavailableError,
     UnsupportedMediaTypeError,
 )
+from app.core.batch_loading import DuckDBBatchLoader
+from app.core.config import Settings
+from app.core.import_coordinator import ImportCoordinator
+from app.core.import_jobs import ImportJobNotFound, ImportState
+from app.core.import_jobs import ImportJobRepository
 from app.core.import_service import store_upload
 from app.core.json_array_validation import summarize_json_array_file
 from app.core.ndjson_validation import summarize_ndjson_file
+from app.core.processing_adapters import create_processing_adapter
 from app.schemas.imports import (
     ImportResponse,
+    ImportErrorsResponse,
+    ImportSummaryResponse,
+    ImportStatusResponse,
     JsonArrayValidationResponse,
     NdjsonValidationResponse,
 )
@@ -117,9 +137,17 @@ def create_checkout_order(payload: CheckoutOrderRequest):
     "/imports",
     response_model=ImportResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    summary="Queue a JSON-array or canonical-NDJSON order import",
+    description=(
+        "JSON uploads are cleaned and validated by the Day 5 pipeline. "
+        "NDJSON uploads must already follow the canonical accepted-record schema."
+    ),
 )
 async def import_orders(
     settings: SettingsDependency,
+    repository: ImportJobRepositoryDependency,
+    writer_lock: ImportWriterLockDependency,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ) -> ImportResponse:
     media_type = (file.content_type or "").split(";", 1)[0].strip().lower()
@@ -135,13 +163,161 @@ async def import_orders(
         )
 
     result = await store_upload(file, settings, suffix=suffix)
+    repository.create(
+        import_id=result.import_id,
+        stored_filename=result.stored_filename,
+        checksum=result.checksum,
+        bytes_received=result.bytes_received,
+    )
+    job = repository.transition(result.import_id, ImportState.queued)
+    background_tasks.add_task(
+        _run_import,
+        repository,
+        settings,
+        result.import_id,
+        settings.upload_directory / result.stored_filename,
+        suffix,
+        writer_lock,
+    )
 
     return ImportResponse(
         import_id=result.import_id,
         checksum=result.checksum,
         stored_filename=result.stored_filename,
         bytes_received=result.bytes_received,
-        state="queued",
+        state=job.state,
+    )
+
+
+def _run_import(
+    repository: ImportJobRepository,
+    settings: Settings,
+    import_id: str,
+    input_path: Path,
+    suffix: str,
+    writer_lock: LockType,
+) -> None:
+    coordinator = ImportCoordinator(
+        repository=repository,
+        adapter=create_processing_adapter(
+            settings.processing_engine,
+            maximum_record_bytes=settings.maximum_record_bytes,
+        ),
+        batch_loader=DuckDBBatchLoader(
+            settings.output_directory / "imports.duckdb",
+            batch_size=settings.import_batch_size,
+            maximum_batch_bytes=settings.import_batch_bytes,
+            maximum_record_bytes=settings.maximum_record_bytes,
+            maximum_items_per_order=settings.maximum_items_per_order,
+        ),
+        output_directory=settings.output_directory,
+        supported_currencies=settings.supported_currencies,
+    )
+    with writer_lock:
+        if suffix == ".json":
+            coordinator.run(import_id, input_path)
+        else:
+            coordinator.run_canonical_ndjson(import_id, input_path)
+
+
+@router.get(
+    "/imports/{import_id}",
+    response_model=ImportStatusResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_import_status(
+    import_id: str,
+    repository: ImportJobRepositoryDependency,
+) -> ImportStatusResponse:
+    try:
+        job = repository.get(import_id)
+    except ImportJobNotFound as exc:
+        raise ImportNotFoundError(f"Import {import_id} was not found") from exc
+
+    return ImportStatusResponse(
+        import_id=job.import_id,
+        state=job.state,
+        bytes_received=job.bytes_received,
+        total_records=job.total_records,
+        accepted_records=job.accepted_records,
+        rejected_records=job.rejected_records,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        failure_code=job.failure_code,
+        failure_message=job.failure_message,
+    )
+
+
+@router.get(
+    "/imports/{import_id}/summary",
+    response_model=ImportSummaryResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_import_summary(
+    import_id: str,
+    settings: SettingsDependency,
+    repository: ImportJobRepositoryDependency,
+) -> ImportSummaryResponse:
+    try:
+        job = repository.get(import_id)
+    except ImportJobNotFound as exc:
+        raise ImportNotFoundError(f"Import {import_id} was not found") from exc
+
+    if job.state not in {
+        ImportState.completed,
+        ImportState.completed_with_errors,
+    }:
+        raise ImportNotReadyError(f"Import {import_id} has no published summary")
+    summary_path = settings.output_directory / import_id / "summary.json"
+    if not summary_path.is_file():
+        raise ImportNotReadyError(f"Import {import_id} has no published summary")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    return ImportSummaryResponse(
+        import_id=import_id,
+        state=job.state,
+        total_records=job.total_records,
+        accepted_records=job.accepted_records,
+        rejected_records=job.rejected_records,
+        failures_by_code=summary["failures_by_code"],
+    )
+
+
+@router.get(
+    "/imports/{import_id}/errors",
+    response_model=ImportErrorsResponse,
+    status_code=status.HTTP_200_OK,
+)
+def get_import_errors(
+    import_id: str,
+    settings: SettingsDependency,
+    repository: ImportJobRepositoryDependency,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> ImportErrorsResponse:
+    try:
+        job = repository.get(import_id)
+    except ImportJobNotFound as exc:
+        raise ImportNotFoundError(f"Import {import_id} was not found") from exc
+
+    if job.state not in {
+        ImportState.completed,
+        ImportState.completed_with_errors,
+    }:
+        raise ImportNotReadyError(f"Import {import_id} has no published errors")
+    rejected_path = settings.output_directory / import_id / "rejected.ndjson"
+    if not rejected_path.is_file():
+        raise ImportNotReadyError(f"Import {import_id} has no published errors")
+
+    errors: list[dict[str, object]] = []
+    with rejected_path.open("r", encoding="utf-8") as source:
+        for line in source:
+            errors.append(json.loads(line))
+            if len(errors) == limit:
+                break
+    return ImportErrorsResponse(
+        import_id=import_id,
+        total_errors=job.rejected_records,
+        returned_errors=len(errors),
+        errors=errors,
     )
 
 
@@ -161,9 +337,6 @@ async def validate_ndjson_import(
     file: UploadFile = File(...),
 ) -> NdjsonValidationResponse:
     media_type = (file.content_type or "").split(";", 1)[0].strip().lower()
-    # Some browsers report an unknown .ndjson file as application/octet-stream.
-    # The endpoint path already selects the NDJSON parser, so allow that generic
-    # media type while still rejecting explicitly different formats such as JSON.
     if media_type not in {"application/x-ndjson", "application/octet-stream"}:
         raise UnsupportedMediaTypeError(
             "Expected an NDJSON file",

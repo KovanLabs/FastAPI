@@ -1,5 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from app.api.dependencies import get_order_validation_service
 from app.main import app
@@ -62,6 +63,14 @@ def test_order_validation_service_is_callable_without_fastapi() -> None:
 
     assert result.order_id == "ORD-2001"
     assert result.accepted is True
+
+
+def test_order_model_rejects_more_than_the_item_limit() -> None:
+    payload = valid_order()
+    payload["items"] = [{"sku": "SKU-1", "quantity": 1}] * 1_001
+
+    with pytest.raises(ValidationError):
+        OrderCreate.model_validate(payload)
 
 
 def test_validate_order_dependency_can_be_overridden() -> None:

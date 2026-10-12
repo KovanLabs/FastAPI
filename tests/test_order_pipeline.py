@@ -107,7 +107,7 @@ def test_pipeline_separates_cleaned_valid_and_rejected_orders() -> None:
     assert outcomes[3].order.currency == "INR"
     assert outcomes[4].order is not None
     assert outcomes[4].order.status == "pending"
-    assert outcomes[5].issues[0].location == "items.0.sku"
+    assert outcomes[5].issues[0].location == ("items", 0, "sku")
 
 
 def test_pipeline_reports_non_object_and_unsupported_currency() -> None:
