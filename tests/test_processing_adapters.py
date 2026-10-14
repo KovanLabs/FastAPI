@@ -12,6 +12,7 @@ from app.core.processing_adapters import (
 
 
 GOLDEN_DIRECTORY = Path(__file__).parent / "golden" / "day5"
+GOLDEN_PROCESSED = Path(__file__).parent / "golden" / "day6" / "processed.ndjson"
 
 
 @pytest.mark.parametrize("engine", ["python", "polars", "duckdb"])
@@ -33,7 +34,7 @@ def test_standard_python_adapter_reproduces_golden_accepted_output(
     assert result.engine == "python"
     assert result.records_written == 1
     assert result.output_path == output
-    assert output.read_bytes() == source.read_bytes()
+    assert output.read_bytes() == GOLDEN_PROCESSED.read_bytes()
 
 
 def test_polars_adapter_reproduces_golden_accepted_output(tmp_path: Path) -> None:
@@ -45,7 +46,7 @@ def test_polars_adapter_reproduces_golden_accepted_output(tmp_path: Path) -> Non
     assert result.engine == "polars"
     assert result.records_written == 1
     assert result.output_path == output
-    assert output.read_bytes() == source.read_bytes()
+    assert output.read_bytes() == GOLDEN_PROCESSED.read_bytes()
 
 
 def test_duckdb_adapter_reproduces_golden_accepted_output(tmp_path: Path) -> None:
@@ -57,7 +58,7 @@ def test_duckdb_adapter_reproduces_golden_accepted_output(tmp_path: Path) -> Non
     assert result.engine == "duckdb"
     assert result.records_written == 1
     assert result.output_path == output
-    assert output.read_bytes() == source.read_bytes()
+    assert output.read_bytes() == GOLDEN_PROCESSED.read_bytes()
 
 
 def test_duckdb_adapter_can_capture_peak_engine_resources(tmp_path: Path) -> None:
@@ -110,12 +111,12 @@ def test_adapters_order_records_and_fields_deterministically(
     output = tmp_path / "output.ndjson.part"
     source.write_text(
         '{"order":{"items":[{"quantity":2,"sku":"A-1"},'
-        '{"quantity":0,"sku":"A-2"}],"status":"completed",'
+        '{"quantity":3,"sku":"A-2"}],"status":"completed",'
         '"ordered_at":"2026-10-06T09:00:00+05:30","currency":"USD",'
         '"amount":"1.00","customer_email":"a@example.com","order_id":"A"},'
         '"record_number":1}\n'
         '{"order":{"status":"pending","items":['
-        '{"quantity":,"sku":"B-2"},{"sku":"B-1","quantity":1}],'
+        '{"quantity":2,"sku":"B-2"},{"sku":"B-1","quantity":1}],'
         '"ordered_at":"2026-10-06T10:00:00+05:30","currency":"INR",'
         '"amount":"2.00","customer_email":"b@example.com","order_id":"B"},'
         '"record_number":2}\n',
@@ -211,6 +212,32 @@ def test_adapters_reject_non_increasing_record_numbers(
             '"ordered_at":"2026-10-06T09:00:00+05:30",'
             '"status":"pending","items":[{"sku":"A","quantity":1}]}}'
         ),
+        (
+            '{"record_number":1,"order":{"order_id":"A",'
+            '"customer_email":"a@example.com","amount":"1.00","currency":"USD",'
+            '"ordered_at":"2026-10-06T09:00:00+05:30",'
+            '"status":"pending","items":[]}}'
+        ),
+        (
+            '{"record_number":1,"order":{"order_id":"A",'
+            '"customer_email":"a@example.com","amount":"1.00","currency":"USD",'
+            '"ordered_at":"2026-10-06T09:00:00+05:30",'
+            '"status":"pending","items":[{"sku":"A","quantity":0}]}}'
+        ),
+        (
+            '{"record_number":1,"order":{"order_id":"A",'
+            '"customer_email":"a@example.com","amount":"1.00","currency":"USD",'
+            '"ordered_at":"2026-10-06T09:00:00+05:30",'
+            '"status":"pending","items":[{"sku":"A","quantity":-1}]}}'
+        ),
+        (
+            '{"record_number":1,"order":{"order_id":"A",'
+            '"customer_email":"a@example.com","amount":"1.00","currency":"USD",'
+            '"ordered_at":"2026-10-06T09:00:00+05:30",'
+            '"status":"pending","items":['
+            '{"sku":"A","quantity":9223372036854775807},'
+            '{"sku":"B","quantity":1}]}}'
+        ),
     ],
     ids=[
         "malformed-json",
@@ -219,6 +246,10 @@ def test_adapters_reject_non_increasing_record_numbers(
         "quantity-not-strict-integer",
         "record-number-not-strict-integer",
         "record-number-over-int64",
+        "empty-items",
+        "zero-quantity",
+        "negative-quantity",
+        "total-quantity-over-int64",
     ],
 )
 @pytest.mark.parametrize(

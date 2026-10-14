@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 import duckdb
+
+from app.core.log_context import bind_log_context
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,7 @@ class DuckDBBatchLoader:
         maximum_batch_bytes: int = 16 * 1024 * 1024,
         maximum_record_bytes: int = 1024 * 1024,
         maximum_items_per_order: int = 1_000,
+        progress_log_interval: int = 100_000,
         memory_limit: str = "512MB",
         threads: int = 2,
     ) -> None:
@@ -72,6 +79,10 @@ class DuckDBBatchLoader:
             raise ValueError("maximum_record_bytes must be positive")
         if maximum_items_per_order <= 0:
             raise ValueError("maximum_items_per_order must be positive")
+        if progress_log_interval < 100_000:
+            raise ValueError(
+                "progress_log_interval must be at least 100000"
+            )
         if threads <= 0:
             raise ValueError("threads must be positive")
         self.database_path = database_path
@@ -79,12 +90,54 @@ class DuckDBBatchLoader:
         self.maximum_batch_bytes = maximum_batch_bytes
         self.maximum_record_bytes = maximum_record_bytes
         self.maximum_items_per_order = maximum_items_per_order
+        self.progress_log_interval = progress_log_interval
         self.memory_limit = memory_limit
         self.threads = threads
 
-    def load(self, input_path: Path, *, import_id: str) -> BatchLoadResult:
+    def load(
+        self,
+        input_path: Path,
+        *,
+        import_id: str,
+        attempt: int = 1,
+    ) -> BatchLoadResult:
         if not import_id:
             raise ValueError("import_id must not be empty")
+        if attempt <= 0:
+            raise ValueError("attempt must be positive")
+
+        with bind_log_context(
+            import_id=import_id,
+            engine="duckdb",
+            attempt=attempt,
+        ):
+            logger.info(
+                "Batch loading started",
+                extra={"event": "batch.loading_started"},
+            )
+            try:
+                result = self._load(input_path, import_id=import_id)
+            except Exception as exc:
+                logger.exception(
+                    "Batch loading failed",
+                    extra={
+                        "event": "batch.loading_failed",
+                        "retryable": getattr(exc, "retryable", False),
+                    },
+                )
+                raise
+            logger.info(
+                "Batch loading completed",
+                extra={
+                    "event": "batch.loading_completed",
+                    "records_processed": result.records_seen,
+                    "batches_committed": result.batches_committed,
+                    "batches_skipped": result.batches_skipped,
+                },
+            )
+            return result
+
+    def _load(self, input_path: Path, *, import_id: str) -> BatchLoadResult:
 
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         temp_directory = self.database_path.parent / f".{self.database_path.name}.tmp"
@@ -94,6 +147,7 @@ class DuckDBBatchLoader:
         batches_skipped = 0
         input_digest = hashlib.sha256()
         total_batches = 0
+        next_progress_at = self.progress_log_interval
 
         try:
             with duckdb.connect(str(self.database_path)) as connection:
@@ -142,49 +196,37 @@ class DuckDBBatchLoader:
                     records_seen += len(batch)
                     for line in batch:
                         input_digest.update(line.encode("utf-8"))
-                    checksum = _batch_checksum(batch)
-                    existing = connection.execute(
-                        """
-                        SELECT batch_checksum, record_count
-                        FROM import_batches
-                        WHERE import_id = ? AND batch_number = ?
-                        """,
-                        [import_id, batch_number],
-                    ).fetchone()
-                    if existing is not None:
-                        if existing != (checksum, len(batch)):
-                            raise BatchReplayConflict(
-                                "batch idempotency key was replayed with different content"
+                    with bind_log_context(batch_number=batch_number):
+                        try:
+                            committed = self._load_one_batch(
+                                connection,
+                                import_id=import_id,
+                                batch_number=batch_number,
+                                batch=batch,
                             )
-                        batches_skipped += 1
-                        continue
+                        except Exception:
+                            logger.exception(
+                                "Batch failed",
+                                extra={"event": "batch.failed"},
+                            )
+                            raise
 
-                    connection.execute("BEGIN TRANSACTION")
-                    try:
-                        _insert_batch(
-                            connection,
-                            import_id=import_id,
-                            batch=batch,
-                            maximum_items_per_order=self.maximum_items_per_order,
-                        )
-                        connection.execute(
-                            """
-                            INSERT INTO import_batches(
-                                import_id,
-                                batch_number,
-                                batch_checksum,
-                                record_count
-                            ) VALUES (?, ?, ?, ?)
-                            """,
-                            [import_id, batch_number, checksum, len(batch)],
-                        )
-                        connection.execute("COMMIT")
-                    except BaseException:
-                        connection.execute("ROLLBACK")
-                        raise
-
-                    records_inserted += len(batch)
-                    batches_committed += 1
+                        if committed:
+                            records_inserted += len(batch)
+                            batches_committed += 1
+                        else:
+                            batches_skipped += 1
+                        if records_seen >= next_progress_at:
+                            logger.info(
+                                "Batch loading progress",
+                                extra={
+                                    "event": "batch.progress",
+                                    "records_processed": records_seen,
+                                },
+                            )
+                            next_progress_at = (
+                                records_seen // self.progress_log_interval + 1
+                            ) * self.progress_log_interval
 
                 ledger_shape = connection.execute(
                     """
@@ -245,6 +287,55 @@ class DuckDBBatchLoader:
             batches_skipped=batches_skipped,
         )
 
+    def _load_one_batch(
+        self,
+        connection: duckdb.DuckDBPyConnection,
+        *,
+        import_id: str,
+        batch_number: int,
+        batch: list[str],
+    ) -> bool:
+        checksum = _batch_checksum(batch)
+        existing = connection.execute(
+            """
+            SELECT batch_checksum, record_count
+            FROM import_batches
+            WHERE import_id = ? AND batch_number = ?
+            """,
+            [import_id, batch_number],
+        ).fetchone()
+        if existing is not None:
+            if existing != (checksum, len(batch)):
+                raise BatchReplayConflict(
+                    "batch idempotency key was replayed with different content"
+                )
+            return False
+
+        connection.execute("BEGIN TRANSACTION")
+        try:
+            _insert_batch(
+                connection,
+                import_id=import_id,
+                batch=batch,
+                maximum_items_per_order=self.maximum_items_per_order,
+            )
+            connection.execute(
+                """
+                INSERT INTO import_batches(
+                    import_id,
+                    batch_number,
+                    batch_checksum,
+                    record_count
+                ) VALUES (?, ?, ?, ?)
+                """,
+                [import_id, batch_number, checksum, len(batch)],
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+        return True
+
     def discard_import(self, import_id: str) -> None:
         """Compensate a failed coordinator step by deleting this import."""
 
@@ -302,6 +393,8 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
             currency VARCHAR NOT NULL,
             ordered_at VARCHAR NOT NULL,
             status VARCHAR NOT NULL,
+            item_count BIGINT NOT NULL,
+            total_quantity BIGINT NOT NULL,
             PRIMARY KEY (import_id, record_number)
         );
 
@@ -314,6 +407,14 @@ def _create_tables(connection: duckdb.DuckDBPyConnection) -> None:
             PRIMARY KEY (import_id, record_number, item_position)
         );
         """
+    )
+    # Day 05 databases predate the derived metrics. Keep existing local data
+    # usable while allowing all newly processed rows to store the Day 06 shape.
+    connection.execute(
+        "ALTER TABLE accepted_orders ADD COLUMN IF NOT EXISTS item_count BIGINT"
+    )
+    connection.execute(
+        "ALTER TABLE accepted_orders ADD COLUMN IF NOT EXISTS total_quantity BIGINT"
     )
 
 
@@ -406,6 +507,18 @@ def _insert_batch(
             raise PermanentBatchLoadError(
                 "canonical order exceeds the configured item limit"
             )
+        item_count = envelope.get("item_count")
+        total_quantity = envelope.get("total_quantity")
+        expected_total_quantity = sum(item["quantity"] for item in items)
+        if (
+            type(item_count) is not int
+            or type(total_quantity) is not int
+            or item_count != len(items)
+            or total_quantity != expected_total_quantity
+        ):
+            raise PermanentBatchLoadError(
+                "processed order contains inconsistent derived metrics"
+            )
         order_rows.append(
             (
                 import_id,
@@ -416,6 +529,8 @@ def _insert_batch(
                 order["currency"],
                 order["ordered_at"],
                 order["status"],
+                item_count,
+                total_quantity,
             )
         )
         item_rows.extend(
@@ -431,7 +546,18 @@ def _insert_batch(
 
     connection.executemany(
         """
-        INSERT INTO accepted_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO accepted_orders(
+            import_id,
+            record_number,
+            order_id,
+            customer_email,
+            amount,
+            currency,
+            ordered_at,
+            status,
+            item_count,
+            total_quantity
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         order_rows,
     )

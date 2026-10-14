@@ -1,10 +1,19 @@
 import asyncio
 import json
+import logging
 
 from pathlib import Path
 from _thread import LockType
 
-from fastapi import APIRouter, BackgroundTasks, File, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 
 from app.api.dependencies import (
     ImportJobRepositoryDependency,
@@ -25,6 +34,7 @@ from app.core.config import Settings
 from app.core.import_coordinator import ImportCoordinator
 from app.core.import_jobs import ImportJobNotFound, ImportState
 from app.core.import_jobs import ImportJobRepository
+from app.core.log_context import bind_log_context
 from app.core.import_service import store_upload
 from app.core.json_array_validation import summarize_json_array_file
 from app.core.ndjson_validation import summarize_ndjson_file
@@ -45,6 +55,7 @@ from app.schemas.orders import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 ORDERS: dict[str, OrderResponse] = {}
 
 
@@ -144,6 +155,7 @@ def create_checkout_order(payload: CheckoutOrderRequest):
     ),
 )
 async def import_orders(
+    request: Request,
     settings: SettingsDependency,
     repository: ImportJobRepositoryDependency,
     writer_lock: ImportWriterLockDependency,
@@ -170,6 +182,11 @@ async def import_orders(
         bytes_received=result.bytes_received,
     )
     job = repository.transition(result.import_id, ImportState.queued)
+    with bind_log_context(import_id=result.import_id):
+        logger.info(
+            "Import queued",
+            extra={"event": "import.queued"},
+        )
     background_tasks.add_task(
         _run_import,
         repository,
@@ -178,6 +195,7 @@ async def import_orders(
         settings.upload_directory / result.stored_filename,
         suffix,
         writer_lock,
+        request.state.request_id,
     )
 
     return ImportResponse(
@@ -196,28 +214,35 @@ def _run_import(
     input_path: Path,
     suffix: str,
     writer_lock: LockType,
+    request_id: str | None = None,
 ) -> None:
-    coordinator = ImportCoordinator(
-        repository=repository,
-        adapter=create_processing_adapter(
-            settings.processing_engine,
-            maximum_record_bytes=settings.maximum_record_bytes,
-        ),
-        batch_loader=DuckDBBatchLoader(
-            settings.output_directory / "imports.duckdb",
-            batch_size=settings.import_batch_size,
-            maximum_batch_bytes=settings.import_batch_bytes,
-            maximum_record_bytes=settings.maximum_record_bytes,
-            maximum_items_per_order=settings.maximum_items_per_order,
-        ),
-        output_directory=settings.output_directory,
-        supported_currencies=settings.supported_currencies,
-    )
-    with writer_lock:
-        if suffix == ".json":
-            coordinator.run(import_id, input_path)
-        else:
-            coordinator.run_canonical_ndjson(import_id, input_path)
+    with bind_log_context(
+        request_id=request_id,
+        import_id=import_id,
+        attempt=1,
+    ):
+        coordinator = ImportCoordinator(
+            repository=repository,
+            adapter=create_processing_adapter(
+                settings.processing_engine,
+                maximum_record_bytes=settings.maximum_record_bytes,
+            ),
+            batch_loader=DuckDBBatchLoader(
+                settings.output_directory / "imports.duckdb",
+                batch_size=settings.import_batch_size,
+                maximum_batch_bytes=settings.import_batch_bytes,
+                maximum_record_bytes=settings.maximum_record_bytes,
+                maximum_items_per_order=settings.maximum_items_per_order,
+                progress_log_interval=settings.progress_log_interval,
+            ),
+            output_directory=settings.output_directory,
+            supported_currencies=settings.supported_currencies,
+        )
+        with writer_lock:
+            if suffix == ".json":
+                coordinator.run(import_id, input_path)
+            else:
+                coordinator.run_canonical_ndjson(import_id, input_path)
 
 
 @router.get(

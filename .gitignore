@@ -6,3 +6,4 @@ __pycache__/
 data/uploads/*
 data/output/*
 data/samples/orders_10m.json
+logs/

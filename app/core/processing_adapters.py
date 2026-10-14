@@ -95,9 +95,13 @@ class StandardPythonAdapter:
             output_created = True
             with destination:
                 for value in records:
-                    processed= _add_order_metrics(value)
+                    processed = _add_order_metrics(value)
                     destination.write(
-                        json.dumps (processed, ensure_ascii=False, separators=(",", ":"))
+                        json.dumps(
+                            processed,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
                     )
                     destination.write("\n")
                     records_written += 1
@@ -155,11 +159,7 @@ class PolarsAdapter:
                     output_path=temporary_output_path,
                 )
 
-            plan = pl.scan_ndjson(
-                input_path,
-                schema=CANONICAL_ACCEPTED_SCHEMA,
-                ignore_errors=False,
-            )
+            plan = build_polars_order_plan(input_path)
             plan.sink_ndjson(
                 temporary_output_path,
                 maintain_order=True,
@@ -282,7 +282,17 @@ class DuckDBAdapter:
                                     ordered_at := "order".ordered_at,
                                     status := "order".status,
                                     items := "order".items
-                                ) AS "order"
+                                ) AS "order",
+                                CAST(array_length("order".items) AS BIGINT)
+                                    AS item_count,
+                                CAST(
+                                    list_sum(
+                                        list_transform(
+                                            "order".items,
+                                            item -> item.quantity
+                                        )
+                                    ) AS BIGINT
+                                ) AS total_quantity
                             FROM canonical_input
                         ) TO ? (FORMAT JSON)
                         """,
@@ -348,6 +358,24 @@ def create_processing_adapter(
     return adapter_factory()
 
 
+def build_polars_order_plan(input_path: Path) -> pl.LazyFrame:
+    """Build the lazy order-metrics transformation used by Polars evidence."""
+
+    plan = pl.scan_ndjson(
+        input_path,
+        schema=CANONICAL_ACCEPTED_SCHEMA,
+        ignore_errors=False,
+    )
+    items = pl.col("order").struct.field("items")
+    return plan.with_columns(
+        items.list.len().cast(pl.Int64).alias("item_count"),
+        items.list.eval(pl.element().struct.field("quantity"))
+        .list.sum()
+        .cast(pl.Int64)
+        .alias("total_quantity"),
+    )
+
+
 def _iter_canonical_records(
     path: Path,
     *,
@@ -405,18 +433,24 @@ def _canonical_envelope(value: object) -> dict[str, object]:
     record_number = _require_integer(envelope, "record_number")
     order = _require_object(envelope.get("order"), "order")
     items_value = order.get("items")
-    if not items_value:
-        raise AdapterExecutionError("order.items must be a non-empty")
     if not isinstance(items_value, list):
         raise AdapterExecutionError("order.items must be a JSON array")
+    if not items_value:
+        raise AdapterExecutionError("order.items must not be empty")
 
     items: list[dict[str, object]] = []
+    total_quantity = 0
     for index, item_value in enumerate(items_value):
         item = _require_object(item_value, f"order.items[{index}]")
         quantity = _require_integer(item, "quantity")
         if quantity <= 0:
             raise AdapterExecutionError(
                 f"order.items[{index}].quantity must be positive"
+            )
+        total_quantity += quantity
+        if total_quantity > INT64_MAX:
+            raise AdapterExecutionError(
+                "order item total_quantity must fit in a signed 64-bit integer"
             )
 
         items.append(
@@ -425,8 +459,6 @@ def _canonical_envelope(value: object) -> dict[str, object]:
                 "quantity": quantity,
             }
         )
-
-
     return {
         "record_number": record_number,
         "order": {

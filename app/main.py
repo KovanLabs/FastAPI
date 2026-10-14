@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import logging
+import re
 from threading import Lock
 from time import perf_counter
 from uuid import uuid4
@@ -12,15 +14,34 @@ from app.api.orders import router
 from app.core.config import get_settings
 from app.core.exceptions import ApplicationError
 from app.core.import_jobs import InMemoryImportJobRepository
+from app.core.log_context import bind_log_context
+from app.core.logging_config import configure_logging
+
+
+logger = logging.getLogger(__name__)
+_SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    configure_logging(
+        settings.log_level,
+        file_path=settings.log_file_path,
+        file_backup_count=settings.log_retention_days,
+    )
     settings.upload_directory.mkdir(parents=True, exist_ok=True)
     settings.output_directory.mkdir(parents=True, exist_ok=True)
     app.state.import_job_repository = InMemoryImportJobRepository()
     app.state.import_writer_lock = Lock()
+    logger.info(
+        "Application started",
+        extra={
+            "event": "application.started",
+            "environment": settings.environment,
+            "configured_log_level": settings.log_level.value,
+        },
+    )
     yield
 
 
@@ -48,18 +69,58 @@ class RequestContextMiddleware:
 
         incoming_headers = dict(scope.get("headers", []))
         request_id = incoming_headers.get(b"x-request-id", b"").decode("latin-1")
-        request_id = request_id or f"req_{uuid4().hex}"
+        if _SAFE_REQUEST_ID.fullmatch(request_id) is None:
+            request_id = f"req_{uuid4().hex}"
         scope.setdefault("state", {})["request_id"] = request_id
         started = perf_counter()
+        response_status = 500
 
         async def add_response_headers(message: Message) -> None:
+            nonlocal response_status
             if message["type"] == "http.response.start":
+                response_status = message["status"]
                 headers = MutableHeaders(scope=message)
                 headers["X-Process-Time"] = f"{perf_counter() - started:.6f}"
                 headers["X-Request-ID"] = request_id
             await send(message)
 
-        await self.app(scope, receive, add_response_headers)
+        with bind_log_context(request_id=request_id):
+            logger.info(
+                "HTTP request started",
+                extra={
+                    "event": "request.started",
+                    "http_method": scope["method"],
+                },
+            )
+            try:
+                await self.app(scope, receive, add_response_headers)
+            except Exception:
+                logger.exception(
+                    "HTTP request failed",
+                    extra={
+                        "event": "request.failed",
+                        "http_method": scope["method"],
+                        "status_code": response_status,
+                        "duration_ms": round(
+                            (perf_counter() - started) * 1_000,
+                            3,
+                        ),
+                    },
+                )
+                raise
+            else:
+                logger.info(
+                    "HTTP request completed",
+                    extra={
+                        "event": "request.completed",
+                        "http_method": scope["method"],
+                        "status_code": response_status,
+                        "duration_ms": round(
+                            (perf_counter() - started) * 1_000,
+                            3,
+                        ),
+                    },
+                )
 
 
 app.add_middleware(RequestContextMiddleware)

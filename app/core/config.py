@@ -12,6 +12,14 @@ class ProcessingEngine(StrEnum):
     duckdb = "duckdb"
 
 
+class LogLevel(StrEnum):
+    debug = "DEBUG"
+    info = "INFO"
+    warning = "WARNING"
+    error = "ERROR"
+    critical = "CRITICAL"
+
+
 class Settings(BaseSettings):
     app_name: str = "Vendor Order Import API"
     environment: str = "development"
@@ -24,7 +32,10 @@ class Settings(BaseSettings):
     import_batch_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
     maximum_items_per_order: int = Field(default=1_000, gt=0)
     processing_engine: ProcessingEngine = ProcessingEngine.python
-    progress_log_interval: int = Field(default=10_000, gt=0)
+    log_level: LogLevel = LogLevel.info
+    log_file_path: Path = Path("logs/application.log")
+    log_retention_days: int = Field(default=30, ge=1)
+    progress_log_interval: int = Field(default=100_000, ge=100_000)
     otel_exporter_endpoint: str = "http://localhost:4317"
     telemetry_enabled: bool = True
     supported_currencies: frozenset[str] = frozenset({"EUR", "INR", "USD"})

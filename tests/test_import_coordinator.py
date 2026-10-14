@@ -16,6 +16,7 @@ from app.core.processing_adapters import StandardPythonAdapter
 
 
 GOLDEN_ACCEPTED = Path(__file__).parent / "golden" / "day5" / "accepted.ndjson"
+GOLDEN_PROCESSED = Path(__file__).parent / "golden" / "day6" / "processed.ndjson"
 
 
 def test_import_coordinator_processes_and_loads_a_queued_json_import(
@@ -231,7 +232,7 @@ def test_import_coordinator_processes_queued_canonical_ndjson(
     assert completed.rejected_records == 0
     assert (
         output_directory / "import-1" / "processed.ndjson"
-    ).read_bytes() == source.read_bytes()
+    ).read_bytes() == GOLDEN_PROCESSED.read_bytes()
     assert (output_directory / "import-1" / "rejected.ndjson").read_bytes() == b""
 
 

@@ -20,7 +20,7 @@ def override_test_settings(tmp_path):
         maximum_upload_bytes=100 * 1024 * 1024,
         upload_chunk_bytes=1024 * 1024,
         maximum_record_bytes=1024 * 1024,
-        progress_log_interval=10_000,
+        progress_log_interval=100_000,
         otel_exporter_endpoint="http://localhost:4317",
         telemetry_enabled=False,
     )

@@ -15,8 +15,9 @@ from app.core.import_jobs import (
     ImportJobRepository,
     ImportState,
 )
+from app.core.log_context import bind_log_context
 from app.core.order_pipeline import process_order_file
-from app.core.processing_adapters import OrderProcessingAdapter
+from app.core.processing_adapters import AdapterResult, OrderProcessingAdapter
 
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,12 @@ class ImportCoordinator:
         self.supported_currencies = frozenset(supported_currencies)
 
     def run(self, import_id: str, input_path: Path) -> ImportJob:
+        with bind_log_context(import_id=import_id, attempt=1):
+            return self._run_json_import(import_id, input_path)
+
+    def _run_json_import(self, import_id: str, input_path: Path) -> ImportJob:
         self.repository.transition(import_id, ImportState.processing)
+        logger.info("Import processing started", extra={"event": "import.started"})
         job_directory = self.output_directory / import_id
         accepted_path = job_directory / "accepted.ndjson"
         rejected_path = job_directory / "rejected.ndjson"
@@ -64,7 +70,7 @@ class ImportCoordinator:
                 rejected_path=rejected_path,
                 supported_currencies=self.supported_currencies,
             )
-            self.adapter.process(accepted_path, processed_temporary)
+            self._process_with_adapter(accepted_path, processed_temporary)
             os.replace(processed_temporary, processed_path)
             self.batch_loader.load(processed_path, import_id=import_id)
 
@@ -87,15 +93,20 @@ class ImportCoordinator:
                 if summary.rejected_records
                 else ImportState.completed
             )
-            return self.repository.transition(
+            completed = self.repository.transition(
                 import_id,
                 terminal_state,
                 total_records=summary.total_records,
                 accepted_records=summary.accepted_records,
                 rejected_records=summary.rejected_records,
             )
+            self._log_import_completed(completed)
+            return completed
         except Exception:
-            logger.exception("Import processing failed", extra={"import_id": import_id})
+            logger.exception(
+                "Import processing failed",
+                extra={"event": "import.failed", "import_id": import_id},
+            )
             self._discard_loaded_import(import_id)
             for path in (
                 accepted_path,
@@ -116,7 +127,16 @@ class ImportCoordinator:
     def run_canonical_ndjson(self, import_id: str, input_path: Path) -> ImportJob:
         """Validate and load already-clean canonical accepted NDJSON."""
 
+        with bind_log_context(import_id=import_id, attempt=1):
+            return self._run_canonical_ndjson(import_id, input_path)
+
+    def _run_canonical_ndjson(
+        self,
+        import_id: str,
+        input_path: Path,
+    ) -> ImportJob:
         self.repository.transition(import_id, ImportState.processing)
+        logger.info("Import processing started", extra={"event": "import.started"})
         job_directory = self.output_directory / import_id
         processed_path = job_directory / "processed.ndjson"
         processed_temporary = job_directory / ".processed.ndjson.part"
@@ -127,7 +147,7 @@ class ImportCoordinator:
 
         try:
             job_directory.mkdir(parents=True, exist_ok=True)
-            result = self.adapter.process(input_path, processed_temporary)
+            result = self._process_with_adapter(input_path, processed_temporary)
             os.replace(processed_temporary, processed_path)
             self.batch_loader.load(processed_path, import_id=import_id)
 
@@ -153,15 +173,20 @@ class ImportCoordinator:
                 destination.write("\n")
             os.replace(summary_temporary, summary_path)
 
-            return self.repository.transition(
+            completed = self.repository.transition(
                 import_id,
                 ImportState.completed,
                 total_records=result.records_written,
                 accepted_records=result.records_written,
                 rejected_records=0,
             )
+            self._log_import_completed(completed)
+            return completed
         except Exception:
-            logger.exception("Import processing failed", extra={"import_id": import_id})
+            logger.exception(
+                "Import processing failed",
+                extra={"event": "import.failed", "import_id": import_id},
+            )
             self._discard_loaded_import(import_id)
             for path in (
                 processed_temporary,
@@ -179,11 +204,54 @@ class ImportCoordinator:
                 failure_message="Import processing failed.",
             )
 
+    def _process_with_adapter(
+        self,
+        input_path: Path,
+        temporary_output_path: Path,
+    ) -> AdapterResult:
+        with bind_log_context(engine=self.adapter.engine):
+            logger.info(
+                "Processing engine started",
+                extra={"event": "engine.started"},
+            )
+            try:
+                result = self.adapter.process(input_path, temporary_output_path)
+            except Exception:
+                logger.exception(
+                    "Processing engine failed",
+                    extra={"event": "engine.failed"},
+                )
+                raise
+            logger.info(
+                "Processing engine completed",
+                extra={
+                    "event": "engine.completed",
+                    "records_processed": result.records_written,
+                },
+            )
+            return result
+
+    @staticmethod
+    def _log_import_completed(job: ImportJob) -> None:
+        logger.info(
+            "Import processing completed",
+            extra={
+                "event": "import.completed",
+                "import_state": job.state.value,
+                "total_records": job.total_records,
+                "accepted_records": job.accepted_records,
+                "rejected_records": job.rejected_records,
+            },
+        )
+
     def _discard_loaded_import(self, import_id: str) -> None:
         try:
             self.batch_loader.discard_import(import_id)
         except Exception:
             logger.exception(
                 "Failed to compensate imported database rows",
-                extra={"import_id": import_id},
+                extra={
+                    "event": "import.compensation_failed",
+                    "import_id": import_id,
+                },
             )

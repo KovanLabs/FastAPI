@@ -13,7 +13,20 @@ from app.core.batch_loading import (
 )
 
 
-GOLDEN_ACCEPTED = Path(__file__).parent / "golden" / "day5" / "accepted.ndjson"
+def test_batch_loader_rejects_progress_interval_below_volume_bound(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="progress_log_interval must be at least 100000",
+    ):
+        DuckDBBatchLoader(
+            tmp_path / "imports.duckdb",
+            progress_log_interval=99_999,
+        )
+
+
+GOLDEN_PROCESSED = Path(__file__).parent / "golden" / "day6" / "processed.ndjson"
 
 
 def test_duckdb_batch_loader_commits_once_and_skips_an_identical_replay(
@@ -21,8 +34,8 @@ def test_duckdb_batch_loader_commits_once_and_skips_an_identical_replay(
 ) -> None:
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb", batch_size=1)
 
-    first = loader.load(GOLDEN_ACCEPTED, import_id="import-1")
-    replay = loader.load(GOLDEN_ACCEPTED, import_id="import-1")
+    first = loader.load(GOLDEN_PROCESSED, import_id="import-1")
+    replay = loader.load(GOLDEN_PROCESSED, import_id="import-1")
 
     assert first == BatchLoadResult(
         import_id="import-1",
@@ -40,10 +53,79 @@ def test_duckdb_batch_loader_commits_once_and_skips_an_identical_replay(
     )
 
 
+def test_duckdb_batch_loader_stores_derived_order_metrics(tmp_path: Path) -> None:
+    database_path = tmp_path / "imports.duckdb"
+    loader = DuckDBBatchLoader(database_path)
+
+    loader.load(GOLDEN_PROCESSED, import_id="import-1")
+
+    with duckdb.connect(str(database_path), read_only=True) as connection:
+        stored_metrics = connection.execute(
+            """
+            SELECT item_count, total_quantity
+            FROM accepted_orders
+            WHERE import_id = 'import-1'
+            """
+        ).fetchone()
+
+    assert stored_metrics == (1, 2)
+
+
+def test_duckdb_batch_loader_upgrades_the_day5_order_table(tmp_path: Path) -> None:
+    database_path = tmp_path / "imports.duckdb"
+    with duckdb.connect(str(database_path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE accepted_orders (
+                import_id VARCHAR NOT NULL,
+                record_number BIGINT NOT NULL,
+                order_id VARCHAR NOT NULL,
+                customer_email VARCHAR NOT NULL,
+                amount VARCHAR NOT NULL,
+                currency VARCHAR NOT NULL,
+                ordered_at VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                PRIMARY KEY (import_id, record_number)
+            )
+            """
+        )
+
+    loader = DuckDBBatchLoader(database_path)
+    loader.load(GOLDEN_PROCESSED, import_id="import-1")
+
+    with duckdb.connect(str(database_path), read_only=True) as connection:
+        stored_metrics = connection.execute(
+            """
+            SELECT item_count, total_quantity
+            FROM accepted_orders
+            WHERE import_id = 'import-1'
+            """
+        ).fetchone()
+
+    assert stored_metrics == (1, 2)
+
+
+def test_duckdb_batch_loader_rejects_inconsistent_derived_metrics(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "wrong-metrics.ndjson"
+    source.write_text(
+        GOLDEN_PROCESSED.read_text(encoding="utf-8").replace(
+            '"total_quantity":2',
+            '"total_quantity":99',
+        ),
+        encoding="utf-8",
+    )
+    loader = DuckDBBatchLoader(tmp_path / "imports.duckdb")
+
+    with pytest.raises(PermanentBatchLoadError, match="derived metrics"):
+        loader.load(source, import_id="import-1")
+
+
 def test_duckdb_batch_loader_splits_batches_at_the_byte_budget(
     tmp_path: Path,
 ) -> None:
-    template = GOLDEN_ACCEPTED.read_text(encoding="utf-8").strip()
+    template = GOLDEN_PROCESSED.read_text(encoding="utf-8").strip()
     first = template.replace('"record_number":3', '"record_number":1')
     second = template.replace('"record_number":3', '"record_number":2')
     source = tmp_path / "two-records.ndjson"
@@ -70,7 +152,7 @@ def test_duckdb_batch_loader_rejects_a_record_over_the_byte_limit(
     )
 
     with pytest.raises(BatchLoadError, match="record byte limit"):
-        loader.load(GOLDEN_ACCEPTED, import_id="import-1")
+        loader.load(GOLDEN_PROCESSED, import_id="import-1")
 
 
 def test_duckdb_batch_loader_rejects_too_many_items_in_one_order(
@@ -78,7 +160,7 @@ def test_duckdb_batch_loader_rejects_too_many_items_in_one_order(
 ) -> None:
     import json
 
-    envelope = json.loads(GOLDEN_ACCEPTED.read_text(encoding="utf-8"))
+    envelope = json.loads(GOLDEN_PROCESSED.read_text(encoding="utf-8"))
     envelope["order"]["items"].append({"sku": "SECOND", "quantity": 1})
     source = tmp_path / "too-many-items.ndjson"
     source.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
@@ -104,7 +186,7 @@ def test_duckdb_batch_loader_classifies_transient_database_io_as_retryable(
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb")
 
     with pytest.raises(RetryableBatchLoadError) as captured:
-        loader.load(GOLDEN_ACCEPTED, import_id="import-1")
+        loader.load(GOLDEN_PROCESSED, import_id="import-1")
 
     assert captured.value.retryable is True
 
@@ -115,7 +197,7 @@ def test_duckdb_batch_loader_rolls_back_a_failed_batch_before_retry(
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb", batch_size=2)
     invalid = tmp_path / "invalid.ndjson"
     corrected = tmp_path / "corrected.ndjson"
-    template = GOLDEN_ACCEPTED.read_text(encoding="utf-8").strip()
+    template = GOLDEN_PROCESSED.read_text(encoding="utf-8").strip()
     record_one = template.replace('"record_number":3', '"record_number":1')
     record_two = template.replace('"record_number":3', '"record_number":2')
     invalid.write_text(f"{record_one}\n{record_one}\n", encoding="utf-8")
@@ -141,13 +223,13 @@ def test_duckdb_batch_loader_rejects_changed_content_for_a_committed_key(
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb", batch_size=1)
     changed = tmp_path / "changed.ndjson"
     changed.write_text(
-        GOLDEN_ACCEPTED.read_text(encoding="utf-8").replace(
+        GOLDEN_PROCESSED.read_text(encoding="utf-8").replace(
             '"amount":"2.35"',
             '"amount":"9.99"',
         ),
         encoding="utf-8",
     )
-    loader.load(GOLDEN_ACCEPTED, import_id="import-1")
+    loader.load(GOLDEN_PROCESSED, import_id="import-1")
 
     with pytest.raises(BatchReplayConflict):
         loader.load(changed, import_id="import-1")
@@ -159,7 +241,7 @@ def test_duckdb_batch_loader_rejects_a_different_completed_import_shape(
     replay_kind: str,
 ) -> None:
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb", batch_size=1)
-    template = GOLDEN_ACCEPTED.read_text(encoding="utf-8").strip()
+    template = GOLDEN_PROCESSED.read_text(encoding="utf-8").strip()
     first_record = template.replace('"record_number":3', '"record_number":1')
     second_record = template.replace('"record_number":3', '"record_number":2')
     one_record = tmp_path / "one.ndjson"
@@ -184,7 +266,7 @@ def test_duckdb_batch_loader_rejects_truncated_retry_after_partial_commits(
     tmp_path: Path,
 ) -> None:
     loader = DuckDBBatchLoader(tmp_path / "imports.duckdb", batch_size=1)
-    template = GOLDEN_ACCEPTED.read_text(encoding="utf-8").strip()
+    template = GOLDEN_PROCESSED.read_text(encoding="utf-8").strip()
     first = template.replace('"record_number":3', '"record_number":1')
     second = template.replace('"record_number":3', '"record_number":2')
     partial_failure = tmp_path / "partial-failure.ndjson"

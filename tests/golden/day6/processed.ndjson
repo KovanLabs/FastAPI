@@ -1,0 +1,1 @@
+{"record_number":3,"order":{"order_id":"GOLD-1","customer_email":"last@example.com","amount":"2.35","currency":"INR","ordered_at":"2026-10-06T09:00:00+05:30","status":"completed","items":[{"sku":"Case-Stays","quantity":2}]},"item_count":1,"total_quantity":2}
