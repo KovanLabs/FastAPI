@@ -1,4 +1,4 @@
-"""Run the deterministic two-pass Day 5 order import pipeline."""
+"""Run the deterministic two-pass JSON or CSV order cleaning pipeline."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ def main() -> None:
         supported_currencies=settings.supported_currencies,
         maximum_failure_samples=args.maximum_failure_samples,
         commit_interval=args.commit_interval,
+        maximum_record_bytes=settings.maximum_record_bytes,
     )
     result = asdict(summary)
     result["accepted_path"] = str(args.accepted)

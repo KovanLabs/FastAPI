@@ -36,6 +36,7 @@ from app.core.exceptions import (
 )
 from app.core.batch_loading import DuckDBBatchLoader
 from app.core.config import ProcessingEngine, Settings
+from app.core.csv_export import export_processed_csv
 from app.core.database_health import check_database_health
 from app.core.import_coordinator import ImportCoordinator
 from app.core.import_jobs import (
@@ -191,6 +192,7 @@ async def import_orders(
     suffix_by_type = {
         "application/x-ndjson": ".ndjson",
         "application/json": ".json",
+        "text/csv": ".csv",
     }
     suffix = suffix_by_type.get(media_type)
     if suffix is None:
@@ -202,7 +204,7 @@ async def import_orders(
             },
         )
         raise UnsupportedMediaTypeError(
-            "Expected an NDJSON or JSON file",
+            "Expected a CSV, NDJSON, or JSON file",
             details={"received": media_type},
         )
 
@@ -250,7 +252,7 @@ async def import_orders(
     "/imports/{import_id}/clean",
     response_model=ImportStageResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    summary="Clean and validate a stored raw JSON import",
+    summary="Clean and validate a stored raw JSON or CSV import",
 )
 def clean_import(
     import_id: str,
@@ -445,6 +447,7 @@ def _run_process_stage(
     accepted_path = job_directory / "accepted.ndjson"
     processed_path = job_directory / "processed.ndjson"
     processed_temporary = job_directory / ".processed.ndjson.part"
+    processed_csv_path = job_directory / "processed.csv"
     adapter = create_processing_adapter(
         engine,
         maximum_record_bytes=settings.maximum_record_bytes,
@@ -461,8 +464,24 @@ def _run_process_stage(
         )
         try:
             result = adapter.process(accepted_path, processed_temporary)
-            os.replace(processed_temporary, processed_path)
-            repository.transition(import_id, ImportState.processed)
+            job = repository.get(import_id)
+            csv_import = Path(job.stored_filename).suffix.lower() == ".csv"
+            if csv_import:
+                export_processed_csv(
+                    processed_temporary,
+                    processed_csv_path,
+                    maximum_record_bytes=settings.maximum_record_bytes,
+                )
+                processed_temporary.unlink(missing_ok=True)
+                terminal_state = (
+                    ImportState.completed_with_errors
+                    if job.rejected_records
+                    else ImportState.completed
+                )
+                completed = repository.transition(import_id, terminal_state)
+            else:
+                os.replace(processed_temporary, processed_path)
+                repository.transition(import_id, ImportState.processed)
             logger.info(
                 "Processing engine completed",
                 extra={
@@ -470,9 +489,21 @@ def _run_process_stage(
                     "records_processed": result.records_written,
                 },
             )
+            if csv_import:
+                logger.info(
+                    "Import processing completed",
+                    extra={
+                        "event": "import.completed",
+                        "import_state": completed.state.value,
+                        "total_records": completed.total_records,
+                        "accepted_records": completed.accepted_records,
+                        "rejected_records": completed.rejected_records,
+                    },
+                )
         except Exception:
             processed_temporary.unlink(missing_ok=True)
             processed_path.unlink(missing_ok=True)
+            processed_csv_path.unlink(missing_ok=True)
             logger.exception(
                 "Processing engine failed",
                 extra={"event": "engine.failed"},
@@ -731,6 +762,7 @@ def get_import_artifact(
         "accepted",
         "rejected",
         "processed",
+        "processed_csv",
         "summary",
     ],
     settings: SettingsDependency,
@@ -746,6 +778,8 @@ def get_import_artifact(
         media_type = (
             "application/x-ndjson"
             if path.suffix == ".ndjson"
+            else "text/csv"
+            if path.suffix == ".csv"
             else "application/json"
         )
     else:
@@ -753,6 +787,7 @@ def get_import_artifact(
             "accepted": "accepted.ndjson",
             "rejected": "rejected.ndjson",
             "processed": "processed.ndjson",
+            "processed_csv": "processed.csv",
             "summary": "summary.json",
         }
         path = (
@@ -763,6 +798,8 @@ def get_import_artifact(
         media_type = (
             "application/json"
             if artifact == "summary"
+            else "text/csv"
+            if artifact == "processed_csv"
             else "application/x-ndjson"
         )
     if not path.is_file():
@@ -805,11 +842,14 @@ def _run_import(
             supported_currencies=settings.supported_currencies,
             progress_log_interval=settings.progress_log_interval,
         )
-        with writer_lock:
-            if suffix == ".json":
-                coordinator.run(import_id, input_path)
-            else:
-                coordinator.run_canonical_ndjson(import_id, input_path)
+        if suffix == ".csv":
+            coordinator.run(import_id, input_path)
+        else:
+            with writer_lock:
+                if suffix == ".json":
+                    coordinator.run(import_id, input_path)
+                else:
+                    coordinator.run_canonical_ndjson(import_id, input_path)
 
 
 @router.get(

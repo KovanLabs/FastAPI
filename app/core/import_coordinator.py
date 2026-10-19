@@ -1,4 +1,4 @@
-"""Coordinate deferred JSON and canonical NDJSON imports."""
+"""Coordinate deferred JSON, CSV, and canonical NDJSON imports."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
 
+from app.core.csv_export import export_processed_csv
 from app.core.import_jobs import (
     ImportJob,
     ImportJobRepository,
@@ -60,6 +61,7 @@ class ImportCoordinator:
         accepted_path = job_directory / "accepted.ndjson"
         rejected_path = job_directory / "rejected.ndjson"
         processed_path = job_directory / "processed.ndjson"
+        processed_csv_path = job_directory / "processed.csv"
         processed_temporary = job_directory / ".processed.ndjson.part"
         summary_path = job_directory / "summary.json"
         summary_temporary = job_directory / ".summary.json.part"
@@ -75,8 +77,16 @@ class ImportCoordinator:
                 maximum_record_bytes=self.adapter.maximum_record_bytes,
             )
             self._process_with_adapter(accepted_path, processed_temporary)
-            os.replace(processed_temporary, processed_path)
-            self.batch_loader.load(processed_path, import_id=import_id)
+            if input_path.suffix.lower() == ".csv":
+                export_processed_csv(
+                    processed_temporary,
+                    processed_csv_path,
+                    maximum_record_bytes=self.adapter.maximum_record_bytes,
+                )
+                processed_temporary.unlink(missing_ok=True)
+            else:
+                os.replace(processed_temporary, processed_path)
+                self.batch_loader.load(processed_path, import_id=import_id)
 
             with summary_temporary.open(
                 "x",
@@ -111,12 +121,14 @@ class ImportCoordinator:
                 "Import processing failed",
                 extra={"event": "import.failed", "import_id": import_id},
             )
-            self._discard_loaded_import(import_id)
+            if input_path.suffix.lower() != ".csv":
+                self._discard_loaded_import(import_id)
             for path in (
                 accepted_path,
                 rejected_path,
                 processed_temporary,
                 processed_path,
+                processed_csv_path,
                 summary_temporary,
                 summary_path,
             ):

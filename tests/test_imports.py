@@ -228,6 +228,66 @@ def test_cleaned_import_can_be_processed_with_duckdb_without_loading(
     assert not (override_test_settings.output_directory / "imports.duckdb").exists()
 
 
+def test_staged_csv_import_finishes_as_csv_without_loading_duckdb(
+    override_test_settings,
+    client,
+) -> None:
+    csv_body = (
+        "order_id,customer_email,amount,currency,ordered_at,status,items\n"
+        'ORD-1,buyer@example.com,10.50,INR,2026-10-05T04:30:00+00:00,'
+        'pending,"[{""sku"":""SKU-1"",""quantity"":2}]"\n'
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.csv", csv_body, "text/csv")},
+    )
+
+    assert uploaded.status_code == 202
+    import_id = uploaded.json()["import_id"]
+    assert client.post(f"/imports/{import_id}/clean").status_code == 202
+    processed = client.post(
+        f"/imports/{import_id}/process?engine=duckdb"
+    )
+
+    assert processed.status_code == 202
+    status = client.get(f"/imports/{import_id}").json()
+    assert status["state"] == "completed"
+    job_directory = override_test_settings.output_directory / import_id
+    assert (job_directory / "processed.csv").is_file()
+    assert not (job_directory / "processed.ndjson").exists()
+    assert not (override_test_settings.output_directory / "imports.duckdb").exists()
+    artifact = client.get(f"/imports/{import_id}/artifacts/processed_csv")
+    assert artifact.status_code == 200
+    assert artifact.headers["content-type"].startswith("text/csv")
+    assert client.post(f"/imports/{import_id}/load").status_code == 409
+
+
+def test_automatic_csv_import_finishes_as_csv_without_loading_duckdb(
+    override_test_settings,
+    client,
+) -> None:
+    csv_body = (
+        "order_id,customer_email,amount,currency,ordered_at,status,items\n"
+        'ORD-1,buyer@example.com,10.50,INR,2026-10-05T04:30:00+00:00,'
+        'pending,"[{""sku"":""SKU-1"",""quantity"":2}]"\n'
+    ).encode()
+
+    response = client.post(
+        "/imports",
+        files={"file": ("orders.csv", csv_body, "text/csv")},
+    )
+
+    assert response.status_code == 202
+    import_id = response.json()["import_id"]
+    status = client.get(f"/imports/{import_id}").json()
+    assert status["state"] == "completed"
+    assert status["accepted_records"] == 1
+    job_directory = override_test_settings.output_directory / import_id
+    assert (job_directory / "processed.csv").is_file()
+    assert not (job_directory / "processed.ndjson").exists()
+    assert not (override_test_settings.output_directory / "imports.duckdb").exists()
+
+
 def test_processed_import_can_be_loaded_and_completed(
     client,
 ) -> None:

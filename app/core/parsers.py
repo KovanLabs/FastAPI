@@ -25,6 +25,14 @@ class InvalidJsonError(ApplicationError):
         super().__init__(message, details=details or {})
 
 
+class InvalidCsvError(ApplicationError):
+    error_code = "invalid_csv"
+    status_code = 400
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message, details=details or {})
+
+
 @dataclass(frozen=True)
 class ParseOutcome:
 

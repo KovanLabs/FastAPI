@@ -1,4 +1,4 @@
-"""Bounded cleaning and validation for orders in a top-level JSON array."""
+"""Bounded cleaning and validation for JSON-array and CSV orders."""
 
 from __future__ import annotations
 
@@ -18,13 +18,27 @@ import polars as pl
 from pydantic import TypeAdapter, ValidationError
 
 from app.core.order_cleaning import CleaningIssue, clean_order
-from app.core.parsers import InvalidJsonError
+from app.core.parsers import InvalidCsvError, InvalidJsonError, RecordTooLargeError
 from app.core.progress_logging import ProgressEventGate
 from app.schemas.orders import OrderCreate
 
 
 T = TypeVar("T")
 logger = logging.getLogger(__name__)
+
+CSV_ORDER_COLUMNS = (
+    "order_id",
+    "customer_email",
+    "amount",
+    "currency",
+    "ordered_at",
+    "status",
+    "items",
+)
+CSV_NULL = r"\N"
+CSV_SCHEMA = {column: pl.String for column in CSV_ORDER_COLUMNS}
+CSV_BATCH_ROWS = 50_000
+
 
 @dataclass(frozen=True)
 class ValidationIssue:
@@ -113,7 +127,7 @@ def process_order_file(
     progress_log_interval: int = 100_000,
     maximum_record_bytes: int = 1024 * 1024,
 ) -> OrderImportSummary:
-    """Validate JSON orders and publish two NDJSON files with rollback.
+    """Validate JSON or CSV orders and publish two NDJSON files with rollback.
 
     Pass one incrementally parses, cleans, validates, and records decisions in a
     temporary SQLite database. The winners table is updated only by valid
@@ -313,9 +327,87 @@ def _iter_source_orders(
     *,
     maximum_record_bytes: int,
 ) -> Iterator[object]:
-    del maximum_record_bytes
+    if input_path.suffix.lower() == ".csv":
+        yield from iter_csv_orders(
+            input_path,
+            maximum_record_bytes=maximum_record_bytes,
+        )
+        return
     with input_path.open("rb") as source:
         yield from iter_ijson_array(source)
+
+
+def iter_csv_orders(
+    input_path: Path,
+    *,
+    maximum_record_bytes: int,
+    batch_rows: int = CSV_BATCH_ROWS,
+) -> Iterator[object]:
+    """Yield CSV orders parsed by Polars in bounded streaming batches.
+
+    FastAPI first stores the async upload as a bounded local file. This is the
+    earliest safe point for Polars: ``scan_csv`` can then stream from a stable,
+    seekable path without materializing the complete upload.
+    """
+
+    if maximum_record_bytes <= 0:
+        raise ValueError("maximum_record_bytes must be positive")
+    if batch_rows <= 0:
+        raise ValueError("batch_rows must be positive")
+
+    try:
+        orders = pl.scan_csv(
+            input_path,
+            has_header=True,
+            schema_overrides=CSV_SCHEMA,
+            infer_schema=False,
+            null_values=CSV_NULL,
+            empty_string_is_null=False,
+            encoding="utf8",
+            ignore_errors=False,
+            truncate_ragged_lines=False,
+        )
+        columns = tuple(orders.collect_schema().names())
+        if columns != CSV_ORDER_COLUMNS:
+            raise InvalidCsvError(
+                "CSV header must exactly match the canonical order columns",
+                details={"expected_columns": list(CSV_ORDER_COLUMNS)},
+            )
+
+        for batch in orders.collect_batches(
+            chunk_size=batch_rows,
+            maintain_order=True,
+            engine="streaming",
+        ):
+            for order in batch.iter_rows(named=True):
+                if _decoded_csv_record_bytes(order) > maximum_record_bytes:
+                    raise RecordTooLargeError(
+                        "CSV record exceeds the configured record byte limit",
+                        details={
+                            "maximum_record_bytes": maximum_record_bytes
+                        },
+                    )
+                items = order["items"]
+                if isinstance(items, str):
+                    try:
+                        order["items"] = json.loads(items)
+                    except json.JSONDecodeError:
+                        pass
+                yield order
+    except (InvalidCsvError, RecordTooLargeError):
+        raise
+    except (OSError, UnicodeError, pl.exceptions.PolarsError) as exc:
+        raise InvalidCsvError("Malformed UTF-8 CSV input") from exc
+
+
+def _decoded_csv_record_bytes(order: dict[str, object]) -> int:
+    """Bound retained decoded row data before downstream Python validation."""
+
+    field_bytes = sum(
+        len((CSV_NULL if value is None else str(value)).encode("utf-8"))
+        for value in order.values()
+    )
+    return field_bytes + len(order) - 1
 
 
 def _publish_order_outputs(
