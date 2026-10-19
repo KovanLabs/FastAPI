@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CEO FastAPI project cheat sheet</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Reference · CEO meeting</p>
+  <h1>Vendor Order Import API</h1>
+  <p class="lede">A bounded, auditable, engine-neutral pipeline for large vendor order files.</p>
+
+  <div class="callout"><strong>One sentence:</strong> The service streams and stages uploads, incrementally cleans and validates orders, separates accepted and rejected records, enriches valid data through a selectable engine, and loads it into DuckDB in bounded idempotent transactions.</div>
+
+  <h2>Architecture in one view</h2>
+  <div class="flow">upload → stage + SHA-256 → 202 + state machine → incremental parse
+→ clean → Pydantic schema → business rules → SQLite duplicate spool
+→ accepted/rejected NDJSON → Python|Polars|DuckDB enrichment
+→ bounded DuckDB batches → summary/status/errors</div>
+
+  <h2>Five design principles</h2>
+  <ol>
+    <li>Bound resources at every boundary, not only at upload.</li>
+    <li>Separate raw-data recovery from accelerated clean-data transforms.</li>
+    <li>Make correctness deterministic and observable before optimizing speed.</li>
+    <li>Publish safely with temporary files, replacement, transactions, and compensation.</li>
+    <li>Keep infrastructure replaceable behind repository, adapter, and loader interfaces.</li>
+  </ol>
+
+  <h2>Proof points</h2>
+  <table>
+    <tbody>
+      <tr><td>10m parse</td><td>44.734 s, 18.51 MiB peak RSS with incremental <code>ijson</code> on the development machine.</td></tr>
+      <tr><td>Why SQLite</td><td>Python duplicate IDs projected ~1.14 GB heap at 10m; disk-backed index avoids this growth.</td></tr>
+      <tr><td>100k engines</td><td>Python 10.6 s / 77.7 MiB; Polars 6.1 s / 238.6 MiB; DuckDB 6.0 s / 171.5 MiB.</td></tr>
+      <tr><td>Equivalence</td><td>All three processed outputs had identical size and SHA-256 for the benchmark fixture.</td></tr>
+      <tr><td>Verification</td><td>Recorded external run: 236 tests passed in 16.29 s.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Why FastAPI</h2>
+  <p>Typed Pydantic contracts, dependency injection, async upload handling, OpenAPI documentation, middleware, and clear error/response models. FastAPI is the HTTP layer; scalability comes from the pipeline architecture.</p>
+
+  <h2>Current status</h2>
+  <p><strong>Implemented:</strong> API contracts, upload safety, JSON/NDJSON streaming, deterministic cleaning/validation, duplicate policy, three equivalent transformation engines, transactional/idempotent loading, state/status/summary/error APIs, tests and benchmarks.</p>
+  <p><strong>Not yet production durable:</strong> in-memory job state, in-process background tasks, local files, process-local writer lock, incomplete production telemetry.</p>
+  <p><strong>Next:</strong> define SLO/capacity → object storage → durable job/outbox → queue + leased workers → production database choice → observability and end-to-end load/recovery tests.</p>
+
+  <h2>Language to use</h2>
+  <table>
+    <thead><tr><th>Instead of</th><th>Say</th></tr></thead>
+    <tbody>
+      <tr><td>“It uses constant memory.”</td><td>“Memory is controlled by configured chunks, record limits, bounded batches, and measured engine behavior.”</td></tr>
+      <tr><td>“It handles any size.”</td><td>“The parser processed 10m records; the full supported capacity still needs an agreed SLO and end-to-end load test.”</td></tr>
+      <tr><td>“BackgroundTasks is scalable.”</td><td>“It demonstrates deferred processing; production requires a durable queue and workers.”</td></tr>
+      <tr><td>“Polars is best.”</td><td>“Polars was faster here but used more memory; the adapter seam lets us choose by workload.”</td></tr>
+      <tr><td>“Exactly once.”</td><td>“At-least-once-safe batch replay through idempotency keys and checksums.”</td></tr>
+    </tbody>
+  </table>
+
+  <footer>
+    <p>Full rehearsal: <a href="../lessons/0010-explain-project-to-ceo.html">Lesson 10</a>. Evidence: <a href="../evidence/day-04-memory-comparison.md">memory comparison</a>, <a href="../evidence/day-05-duplicate-index-memory.md">duplicate index</a>, and <a href="../evidence/day-06-polars-adapter.md">engine benchmark</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

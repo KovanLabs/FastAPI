@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Day 5 — Contract before code</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 0004 · Day 5</p>
+  <h1>Contract before cleaner</h1>
+  <p class="lede">Your first win is not a validator. It is a policy precise enough that two independent implementations produce byte-for-byte equivalent decisions.</p>
+
+  <nav>
+    <ol>
+      <li>Cleaning policy + rejection catalogue</li>
+      <li>Deterministic cleaner + idempotence</li>
+      <li>Pydantic schema + nested errors</li>
+      <li>Business rules + stable codes</li>
+      <li>Import-scope duplicate index + memory</li>
+      <li>Incremental NDJSON sinks + golden result</li>
+    </ol>
+  </nav>
+
+  <h2>The boundary to learn</h2>
+  <p><strong>Pydantic behavior:</strong> a model or <code>TypeAdapter</code> produces an output conforming to declared types and constraints, and non-strict validation may convert input. Its structured errors include a machine-readable <code>type</code> and a nested <code>loc</code>.</p>
+  <p><strong>Project behavior:</strong> trimming, case folding, blank handling, money scale and rounding, time-zone normalization, supported currencies, duplicate scope, winner policy, public error codes, and output envelopes are choices this project must own.</p>
+  <p class="danger callout">Do not infer that an email may be lowercased, that a naive datetime means UTC, that <code>1.239</code> should round to cents, or that the first duplicate wins. Each changes business meaning.</p>
+
+  <h2>Milestone 1 exercise</h2>
+  <p>Write one policy row for every path: <code>order_id</code>, <code>customer_email</code>, <code>amount</code>, <code>currency</code>, <code>ordered_at</code>, <code>status</code>, <code>items</code>, <code>items[].sku</code>, <code>items[].quantity</code>, and extra fields.</p>
+  <p>For each, state accepted raw JSON types, missing/null/blank behavior, exact cleaning, canonical output, stable reject code, and authority. Mark unknown requirements <strong>OPEN</strong>.</p>
+  <p>Then write the rejection catalogue for parse failure, non-object record, cleaning failure, schema failure, business failure, duplicate, and output failure. State whether one record can carry multiple issues and whether processing continues.</p>
+
+  <h2>Why this precedes implementation</h2>
+  <p>Pydantic’s model documentation explicitly distinguishes output conformance from input validity and documents coercion under “Data conversion”. The validators documentation says before validators receive raw input, while after validators receive the internally validated value. Those mechanics cannot decide your domain policy.</p>
+
+  <h2>Read next</h2>
+  <p>Primary source: Pydantic Models, especially “validation”, “Basic model usage”, and “Data conversion”: <a href="https://docs.pydantic.dev/latest/concepts/models/">https://docs.pydantic.dev/latest/concepts/models/</a></p>
+  <p>Then use the reusable <a href="../reference/day-5-data-contract-checklist.html">Day 5 data-contract checklist</a>.</p>
+  <footer>Reply with your two tables. Your teacher will challenge assumptions, give the correct boundary and exact source, then unlock Milestone 2.</footer>
+</main>
+</body>
+</html>

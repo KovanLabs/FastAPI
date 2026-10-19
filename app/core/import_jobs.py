@@ -12,7 +12,11 @@ from typing import Protocol
 class ImportState(StrEnum):
     uploaded = "uploaded"
     queued = "queued"
+    cleaning = "cleaning"
+    cleaned = "cleaned"
     processing = "processing"
+    processed = "processed"
+    loading = "loading"
     completed = "completed"
     completed_with_errors = "completed_with_errors"
     failed = "failed"
@@ -27,12 +31,28 @@ TERMINAL_IMPORT_STATES = frozenset(
 )
 
 _ALLOWED_TRANSITIONS = {
-    ImportState.uploaded: frozenset({ImportState.queued}),
+    ImportState.uploaded: frozenset(
+        {ImportState.queued, ImportState.cleaning}
+    ),
     ImportState.queued: frozenset({ImportState.processing}),
-    ImportState.processing: TERMINAL_IMPORT_STATES,
+    ImportState.cleaning: frozenset(
+        {ImportState.cleaned, ImportState.failed}
+    ),
+    ImportState.cleaned: frozenset({ImportState.processing}),
+    ImportState.processing: frozenset(
+        {*TERMINAL_IMPORT_STATES, ImportState.processed}
+    ),
+    ImportState.processed: frozenset({ImportState.loading}),
+    ImportState.loading: TERMINAL_IMPORT_STATES,
     ImportState.completed: frozenset(),
     ImportState.completed_with_errors: frozenset(),
-    ImportState.failed: frozenset(),
+    ImportState.failed: frozenset(
+        {
+            ImportState.cleaning,
+            ImportState.processing,
+            ImportState.loading,
+        }
+    ),
 }
 
 
@@ -50,6 +70,9 @@ class ImportJob:
     rejected_records: int = 0
     failure_code: str | None = None
     failure_message: str | None = None
+    failed_stage: str | None = None
+    stage_attempt: int = 0
+    processing_engine: str | None = None
 
 
 class ImportJobError(RuntimeError):
@@ -90,6 +113,9 @@ class ImportJobRepository(Protocol):
         rejected_records: int | None = None,
         failure_code: str | None = None,
         failure_message: str | None = None,
+        failed_stage: str | None = None,
+        stage_attempt: int | None = None,
+        processing_engine: str | None = None,
     ) -> ImportJob: ...
 
 
@@ -141,6 +167,9 @@ class InMemoryImportJobRepository:
         rejected_records: int | None = None,
         failure_code: str | None = None,
         failure_message: str | None = None,
+        failed_stage: str | None = None,
+        stage_attempt: int | None = None,
+        processing_engine: str | None = None,
     ) -> ImportJob:
         with self._lock:
             current = self._jobs.get(import_id)
@@ -171,6 +200,19 @@ class InMemoryImportJobRepository:
                 ),
                 failure_code=failure_code,
                 failure_message=failure_message,
+                failed_stage=(
+                    failed_stage if target is ImportState.failed else None
+                ),
+                stage_attempt=(
+                    current.stage_attempt
+                    if stage_attempt is None
+                    else stage_attempt
+                ),
+                processing_engine=(
+                    current.processing_engine
+                    if processing_engine is None
+                    else processing_engine
+                ),
             )
             self._jobs[import_id] = updated
         return updated

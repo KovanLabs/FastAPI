@@ -24,16 +24,31 @@ _SAFE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    settings = get_settings()
-    configure_logging(
-        settings.log_level,
-        file_path=settings.log_file_path,
-        file_backup_count=settings.log_retention_days,
-    )
-    settings.upload_directory.mkdir(parents=True, exist_ok=True)
-    settings.output_directory.mkdir(parents=True, exist_ok=True)
-    app.state.import_job_repository = InMemoryImportJobRepository()
-    app.state.import_writer_lock = Lock()
+    configure_logging("INFO")
+    environment = "unknown"
+    try:
+        settings = get_settings()
+        environment = settings.environment
+        app.title = settings.app_name
+        configure_logging(
+            settings.log_level,
+            file_path=settings.log_file_path,
+            file_backup_count=settings.log_retention_days,
+        )
+        settings.upload_directory.mkdir(parents=True, exist_ok=True)
+        settings.output_directory.mkdir(parents=True, exist_ok=True)
+        app.state.import_job_repository = InMemoryImportJobRepository()
+        app.state.import_writer_lock = Lock()
+    except Exception:
+        logger.critical(
+            "Application startup failed",
+            exc_info=True,
+            extra={
+                "event": "application.startup_failed",
+                "environment": environment,
+            },
+        )
+        raise
     logger.info(
         "Application started",
         extra={
@@ -46,7 +61,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title=get_settings().app_name,
+    title="Vendor Order Import API",
     version="0.2.0",
     lifespan=lifespan,
 )

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Day 5 data-contract checklist</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Day 5 reference</p>
+  <h1>Deterministic order processing</h1>
+  <p class="lede">A contract checklist for keeping cleaning, schema validation, business validation, duplicate detection, and output writing separate and auditable.</p>
+
+  <h2>Stage contract</h2>
+  <div class="flow">parsed object
+  → deterministic cleaner
+  → Pydantic schema validation
+  → business validation
+  → duplicate decision
+  → exactly one accepted/rejected NDJSON write
+  → reconciled counters</div>
+  <p class="warning callout">This order is provisional until the duplicate policy says whether structurally invalid records reserve their identifiers. That is a business decision, not a Pydantic decision.</p>
+
+  <h2>Field policy columns</h2>
+  <table>
+    <thead><tr><th>Column</th><th>Question it must answer</th></tr></thead>
+    <tbody>
+      <tr><td>Field/path</td><td>Which exact scalar or nested value does the rule govern?</td></tr>
+      <tr><td>Accepted raw forms</td><td>Which JSON types and textual forms are admitted before schema validation?</td></tr>
+      <tr><td>Missing/null/blank</td><td>Are these three states distinct, rejected, or normalized?</td></tr>
+      <tr><td>Cleaning</td><td>What deterministic transformation is applied? “None” is a valid policy.</td></tr>
+      <tr><td>Canonical output</td><td>What exact Python/JSON representation leaves the cleaner?</td></tr>
+      <tr><td>Reject code</td><td>Which stable project-owned code is emitted when the policy fails?</td></tr>
+      <tr><td>Authority</td><td>Requirement, approved business decision, or still an open question?</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Rejection catalogue columns</h2>
+  <table>
+    <thead><tr><th>Column</th><th>Question it must answer</th></tr></thead>
+    <tbody>
+      <tr><td>Stable code</td><td>What machine-readable identifier remains stable when human wording changes?</td></tr>
+      <tr><td>Stage</td><td>Parse, clean, schema, business, duplicate, or write?</td></tr>
+      <tr><td>Location</td><td>How are nested fields and list indexes represented without losing structure?</td></tr>
+      <tr><td>Trigger</td><td>What exact predicate produces this rejection?</td></tr>
+      <tr><td>Public message</td><td>What safe, readable explanation is emitted?</td></tr>
+      <tr><td>Audit data</td><td>Which record number, source identity, duplicate-first occurrence, or raw fragment is retained?</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Required evidence</h2>
+  <ul>
+    <li>Parameterized examples for every cleaning rule and no-op case.</li>
+    <li><code>clean(clean(x)) == clean(x)</code> for every accepted cleaner input.</li>
+    <li>Nested error locations preserved as segments such as <code>("items", 0, "sku")</code>.</li>
+    <li>Duplicate tests spanning records, batches, and the declared import/job scope.</li>
+    <li><code>total == accepted + rejected</code> and output-line counts equal their counters.</li>
+    <li>Measured peak memory for the in-memory duplicate index at realistic cardinality.</li>
+    <li>A frozen standard-library Python golden input, accepted output, rejected output, and summary.</li>
+  </ul>
+
+  <h2>Primary sources</h2>
+  <ul>
+    <li>Pydantic Models — “Basic model usage”, “Model methods and properties”, “Data conversion”: <a href="https://docs.pydantic.dev/latest/concepts/models/">https://docs.pydantic.dev/latest/concepts/models/</a></li>
+    <li>Pydantic Validators — “Field validators”, “Before validators”, “After validators”, “Model validators”: <a href="https://docs.pydantic.dev/latest/concepts/validators/">https://docs.pydantic.dev/latest/concepts/validators/</a></li>
+    <li>Pydantic Error Handling — “Error handling” and structured error details: <a href="https://docs.pydantic.dev/latest/errors/errors/">https://docs.pydantic.dev/latest/errors/errors/</a></li>
+    <li>Pydantic TypeAdapter — standalone and collection validation: <a href="https://docs.pydantic.dev/latest/concepts/type_adapter/">https://docs.pydantic.dev/latest/concepts/type_adapter/</a></li>
+    <li>Python <code>decimal</code> — construction, contexts, and <code>quantize()</code>: <a href="https://docs.python.org/3/library/decimal.html">https://docs.python.org/3/library/decimal.html</a></li>
+    <li>Python <code>sqlite3</code> — parameter binding and transaction control: <a href="https://docs.python.org/3/library/sqlite3.html">https://docs.python.org/3/library/sqlite3.html</a></li>
+  </ul>
+  <footer>Ask your teacher whenever a policy choice lacks an authoritative business requirement. Ambiguity should become an open question, not a guessed transformation.</footer>
+</main>
+</body>
+</html>

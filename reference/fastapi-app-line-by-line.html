@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>The app/ folder, line by line</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Reference</p>
+  <h1>The <code>app/</code> folder, line by line</h1>
+  <p class="lede">Every non-blank source line is represented below. Lines belonging to one multi-line Python statement are grouped, because they perform one operation. Blank lines have no runtime effect; they visually separate imports, classes, and functions according to normal Python style.</p>
+
+  <div class="callout">
+    <strong>The shortest mental model:</strong> <code>main.py</code> assembles the app; <code>api/</code> exposes HTTP; <code>schemas/</code> defines data contracts; <code>services/</code> holds business rules; and <code>core/</code> supplies configuration, errors, storage, uploads, and parsing.
+  </div>
+
+  <nav>
+    <a href="#flow">Request flow</a><br>
+    <a href="#package-files">Package files</a><br>
+    <a href="#config">core/config.py</a><br>
+    <a href="#schemas">schemas/*</a><br>
+    <a href="#exceptions">core/exceptions.py</a><br>
+    <a href="#service">services/order_validation.py</a><br>
+    <a href="#dependencies">api/dependencies.py</a><br>
+    <a href="#orders">api/orders.py</a><br>
+    <a href="#upload">core/import_service.py</a><br>
+    <a href="#storage">core/storage.py</a><br>
+    <a href="#main">main.py</a><br>
+    <a href="#parsers">core/parsers.py</a><br>
+    <a href="#sample">day-04_sample.py</a><br>
+    <a href="#findings">Important findings</a>
+  </nav>
+
+  <section id="flow">
+    <h2>First, see the whole request flow</h2>
+    <div class="flow">Client → ASGI server → RequestContextMiddleware → FastAPI router
+       → dependency resolution → Pydantic input validation → route function
+       → service/core code → response_model serialization → middleware headers → Client
+
+Raised ApplicationError → global exception handler → stable JSON error response</div>
+    <p>That flow explains the folder boundaries. HTTP-specific decisions stay in <code>api/</code>; reusable validation stays in <code>services/</code>; data shapes stay in <code>schemas/</code>; infrastructure stays in <code>core/</code>; assembly stays in <code>main.py</code>.</p>
+  </section>
+
+  <section id="package-files">
+    <h2>Package marker files</h2>
+    <table>
+      <thead><tr><th>File:line</th><th>Code</th><th>What it does and why</th></tr></thead>
+      <tbody>
+        <tr><td>app/__init__.py:1</td><td><code>"""Application package."""</code></td><td>A module docstring. The file marks <code>app</code> as a conventional Python package and describes it. It runs no business logic.</td></tr>
+        <tr><td>schemas/__init__.py:1</td><td><code>"""Shared schema models."""</code></td><td>Marks and documents the schema package. Models are imported from their concrete modules, so this file exports nothing.</td></tr>
+        <tr><td>services/__init__.py:1</td><td><code>&nbsp;</code></td><td>The file is empty. Its existence makes <code>services</code> an explicit package; it has no runtime behavior.</td></tr>
+      </tbody>
+    </table>
+    <p><code>api/</code> and <code>core/</code> have no <code>__init__.py</code>. Modern Python can still resolve them as namespace subpackages under <code>app</code>, although adding package markers would make the layout more explicit.</p>
+  </section>
+
+  <section id="config">
+    <h2><code>app/core/config.py</code> — typed configuration</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from functools import lru_cache</code></td><td>Imports a memoization decorator. It is used at line 22 so settings are constructed once and reused.</td></tr>
+        <tr><td>2</td><td><code>from pathlib import Path</code></td><td>Imports an object-oriented filesystem path type. Directory settings become paths with methods such as <code>mkdir</code>, <code>exists</code>, and <code>stat</code>.</td></tr>
+        <tr><td>4</td><td><code>from pydantic_settings import BaseSettings, SettingsConfigDict</code></td><td><code>BaseSettings</code> loads and validates configuration; <code>SettingsConfigDict</code> configures its sources and naming.</td></tr>
+        <tr><td>7</td><td><code>class Settings(BaseSettings):</code></td><td>Defines one typed source of truth for runtime configuration. Inheriting from <code>BaseSettings</code> allows environment variables and <code>.env</code> values to override defaults.</td></tr>
+        <tr><td>8</td><td><code>app_name: str = "Vendor Order Import API"</code></td><td>Default API title; used by <code>main.py</code> in generated OpenAPI documentation.</td></tr>
+        <tr><td>9</td><td><code>environment: str = "development"</code></td><td>Names the deployment environment. It is currently stored but not used elsewhere.</td></tr>
+        <tr><td>10–11</td><td><code>upload_directory: Path = Path("data/uploads")<br>output_directory: Path = Path("data/output")</code></td><td>Typed storage locations. Relative paths are resolved from the process working directory. Uploads use the first; startup/readiness check both.</td></tr>
+        <tr><td>12</td><td><code>maximum_upload_bytes: int = 100 * 1024 * 1024</code></td><td>A 100 MiB upload limit. Multiplication makes the binary-unit intent readable and avoids a magic decimal literal.</td></tr>
+        <tr><td>13</td><td><code>upload_chunk_bytes: int = 1024 * 1024</code></td><td>Requests upload data in 1 MiB chunks so application memory does not scale with the full file size.</td></tr>
+        <tr><td>14</td><td><code>maximum_record_bytes: int = 1024 * 1024</code></td><td>Caps an individual NDJSON line or JSON array element at 1 MiB. Only the parser module currently consumes it indirectly; no route invokes that parser yet.</td></tr>
+        <tr><td>15</td><td><code>progress_log_interval: int = 10_000</code></td><td>Intended interval for progress reporting. It is not used by current <code>app/</code> code.</td></tr>
+        <tr><td>16</td><td><code>otel_exporter_endpoint: str = "http://localhost:4317"</code></td><td>Placeholder OpenTelemetry collector address. Telemetry is not wired up yet.</td></tr>
+        <tr><td>17</td><td><code>telemetry_enabled: bool = True</code></td><td>Feature flag for telemetry. Also currently unused.</td></tr>
+        <tr><td>18</td><td><code>supported_currencies: frozenset[str] = frozenset({"EUR", "INR", "USD"})</code></td><td>An immutable set gives fast membership checks and prevents accidental mutation. It feeds <code>OrderValidationService</code>.</td></tr>
+        <tr><td>19</td><td><code>model_config = SettingsConfigDict(env_file=".env", env_prefix="APP_")</code></td><td>Tells Pydantic to read <code>.env</code> and prefix field environment names with <code>APP_</code>. Example: <code>APP_MAXIMUM_UPLOAD_BYTES</code>.</td></tr>
+        <tr><td>22–24</td><td><code>@lru_cache<br>def get_settings() -&gt; Settings:<br>&nbsp;&nbsp;&nbsp;&nbsp;return Settings()</code></td><td>The decorator caches the zero-argument function's result. FastAPI can inject this function, tests can override it, and ordinary code avoids reparsing environment settings on every request.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="schemas">
+    <h2><code>app/schemas/</code> — request and response contracts</h2>
+    <h3><code>orders.py</code></h3>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from datetime import datetime</code></td><td>Provides a real date-time type. Pydantic converts ISO-8601 input strings into <code>datetime</code> objects.</td></tr>
+        <tr><td>2</td><td><code>from decimal import Decimal</code></td><td>Provides decimal arithmetic, preferred over binary floating point for money-like values.</td></tr>
+        <tr><td>3</td><td><code>from enum import StrEnum</code></td><td>Provides enum members that also behave like strings, convenient for JSON values and comparisons.</td></tr>
+        <tr><td>5</td><td><code>from pydantic import BaseModel, EmailStr, Field</code></td><td><code>BaseModel</code> supplies parsing/validation/serialization; <code>EmailStr</code> validates email syntax; <code>Field</code> adds constraints.</td></tr>
+        <tr><td>8–11</td><td><code>class OrderStatus(StrEnum):<br>&nbsp;&nbsp;pending = "pending"<br>&nbsp;&nbsp;completed = "completed"<br>&nbsp;&nbsp;cancelled = "cancelled"</code></td><td>Restricts status to three legal wire values. FastAPI exposes these values in OpenAPI and rejects other strings.</td></tr>
+        <tr><td>14</td><td><code>class OrderItem(BaseModel):</code></td><td>Defines the nested shape of one item in an order.</td></tr>
+        <tr><td>15</td><td><code>sku: str = Field(min_length=1, max_length=80)</code></td><td>Requires a non-empty SKU no longer than 80 characters, catching malformed input at the API boundary.</td></tr>
+        <tr><td>16</td><td><code>quantity: int = Field(gt=0, le=10_000)</code></td><td>Requires an integer from 1 through 10,000. <code>gt</code> means greater than; <code>le</code> means less than or equal.</td></tr>
+        <tr><td>19</td><td><code>class OrderCreate(BaseModel):</code></td><td>The canonical input contract for creating or validating an order.</td></tr>
+        <tr><td>20</td><td><code>order_id: str = Field(min_length=1, max_length=100)</code></td><td>Requires a bounded, non-empty identifier.</td></tr>
+        <tr><td>21</td><td><code>customer_email: EmailStr</code></td><td>Validates and represents an email; this is why <code>email-validator</code> appears in requirements.</td></tr>
+        <tr><td>22</td><td><code>amount: Decimal = Field(gt=0)</code></td><td>Parses the input into a positive <code>Decimal</code>, preventing zero or negative order amounts.</td></tr>
+        <tr><td>23</td><td><code>currency: str = Field(min_length=3, max_length=3)</code></td><td>Checks only that the code has exactly three characters. Whether it is supported is a business rule handled later by the service.</td></tr>
+        <tr><td>24</td><td><code>ordered_at: datetime</code></td><td>Converts a valid date-time string to <code>datetime</code>. The type does not itself require a timezone.</td></tr>
+        <tr><td>25</td><td><code>status: OrderStatus</code></td><td>Uses the earlier enum so arbitrary statuses cannot enter the route.</td></tr>
+        <tr><td>26</td><td><code>items: list[OrderItem] = Field(min_length=1)</code></td><td>Requires at least one nested, validated item.</td></tr>
+        <tr><td>29–33</td><td><code>class ShippingAddress(BaseModel):<br>&nbsp;&nbsp;street: str = Field(min_length=1, max_length=200)<br>&nbsp;&nbsp;city: str = Field(min_length=1, max_length=80)<br>&nbsp;&nbsp;postal_code: str = Field(min_length=3, max_length=12)<br>&nbsp;&nbsp;country: str = Field(min_length=2, max_length=2)</code></td><td>Defines a nested shipping-address contract. The country constraint enforces length, not a real ISO-country membership check.</td></tr>
+        <tr><td>36–37</td><td><code>class OrderResponse(OrderCreate):<br>&nbsp;&nbsp;accepted: bool = True</code></td><td>Reuses all validated order fields by inheritance and adds a response-only acceptance flag with a default.</td></tr>
+        <tr><td>40–44</td><td><code>class CheckoutOrderRequest(BaseModel):<br>&nbsp;&nbsp;customer_email: EmailStr<br>&nbsp;&nbsp;currency: str = Field(min_length=3, max_length=3)<br>&nbsp;&nbsp;shipping_address: ShippingAddress<br>&nbsp;&nbsp;items: list[OrderItem] = Field(min_length=1)</code></td><td>Defines a smaller checkout-specific request containing nested address and items. It deliberately omits ID, amount, time, and status.</td></tr>
+      </tbody>
+    </table>
+
+    <h3><code>imports.py</code></h3>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from pydantic import BaseModel</code></td><td>Imports the base for a validated and serializable response contract.</td></tr>
+        <tr><td>4–9</td><td><code>class ImportResponse(BaseModel):<br>&nbsp;&nbsp;import_id: str<br>&nbsp;&nbsp;checksum: str<br>&nbsp;&nbsp;stored_filename: str<br>&nbsp;&nbsp;bytes_received: int<br>&nbsp;&nbsp;state: str</code></td><td>Declares exactly what <code>POST /imports</code> returns. The schema keeps HTTP output separate from the internal <code>ImportResult</code> dataclass. <code>state</code> is any string today; an enum would enforce lifecycle states.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="exceptions">
+    <h2><code>app/core/exceptions.py</code> — stable application failures</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1–3</td><td><code>class ApplicationError(Exception):<br>&nbsp;&nbsp;error_code = "application_error"<br>&nbsp;&nbsp;status_code = 500</code></td><td>Defines a common exception base with safe default API metadata. One global handler can process every subclass.</td></tr>
+        <tr><td>5–8</td><td><code>def __init__(self, message: str, *, details: dict | None = None) -&gt; None:<br>&nbsp;&nbsp;super().__init__(message)<br>&nbsp;&nbsp;self.message = message<br>&nbsp;&nbsp;self.details = details or {}</code></td><td>Initializes normal exception behavior, then keeps explicit fields for JSON output. <code>*</code> forces <code>details</code> to be named at call sites. Missing or empty details become a fresh empty dictionary.</td></tr>
+        <tr><td>11–13</td><td><code>class UploadTooLargeError(ApplicationError):<br>&nbsp;&nbsp;error_code = "upload_too_large"<br>&nbsp;&nbsp;status_code = 413</code></td><td>Specializes the base for an oversized request body: HTTP 413 Payload Too Large.</td></tr>
+        <tr><td>16–18</td><td><code>class EmptyUploadError(ApplicationError): … 400</code></td><td>Represents a client sending an empty file. It inherits the base initializer.</td></tr>
+        <tr><td>21–23</td><td><code>class UploadStorageError(ApplicationError): … 503</code></td><td>Represents server-side storage unavailability as HTTP 503, distinguishing it from bad client input.</td></tr>
+        <tr><td>26–28</td><td><code>class UnsupportedMediaTypeError(ApplicationError): … 415</code></td><td>Represents a file whose declared media type is not accepted.</td></tr>
+        <tr><td>31–33</td><td><code>class UnsupportedCurrencyError(ApplicationError): … 422</code></td><td>Represents a syntactically valid order that violates a domain rule.</td></tr>
+        <tr><td>35–39</td><td><code>def __init__(self, currency: str) -&gt; None:<br>&nbsp;&nbsp;super().__init__(<br>&nbsp;&nbsp;&nbsp;&nbsp;f"Currency {currency} is not supported",<br>&nbsp;&nbsp;&nbsp;&nbsp;details={"currency": currency},<br>&nbsp;&nbsp;)</code></td><td>Builds a consistent human message and machine-readable details from the rejected currency, rather than duplicating this structure at every raise site.</td></tr>
+        <tr><td>42–44</td><td><code>class OrderAlreadyExistsError(ApplicationError): … 409</code></td><td>Maps a duplicate ID conflict to HTTP 409 Conflict.</td></tr>
+        <tr><td>46–50</td><td><code>def __init__(self, order_id: str) …</code></td><td>Constructs the duplicate-order message and <code>{"order_id": ...}</code> detail consistently.</td></tr>
+        <tr><td>53–55</td><td><code>class OrderNotFoundError(ApplicationError): … 404</code></td><td>Maps a missing resource to HTTP 404.</td></tr>
+        <tr><td>57–61</td><td><code>def __init__(self, order_id: str) …</code></td><td>Constructs the missing-order message and details consistently.</td></tr>
+        <tr><td>64–66</td><td><code>class ImportNotFoundError(ApplicationError): … 404</code></td><td>Reserves a stable error type for future import lookup behavior. It is not currently raised.</td></tr>
+        <tr><td>69–71</td><td><code>class StorageDirectoryUnavailableError(ApplicationError): … 503</code></td><td>Represents an unavailable upload/output directory.</td></tr>
+        <tr><td>73–76</td><td><code>def __init__(self, directory: str, *, details: dict | None = None) …<br>&nbsp;&nbsp;self.directory = directory</code></td><td>Creates a default detail dictionary unless the caller supplies one, delegates common fields to the base class, and retains the directory as a direct attribute.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="service">
+    <h2><code>app/services/order_validation.py</code> — a business rule</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from collections.abc import Iterable</code></td><td>Uses the abstract input protocol so the constructor accepts sets, lists, tuples, or other iterables of currency codes.</td></tr>
+        <tr><td>3</td><td><code>from app.core.exceptions import UnsupportedCurrencyError</code></td><td>The service reports a domain failure using the application's stable exception type.</td></tr>
+        <tr><td>4</td><td><code>from app.schemas.orders import OrderCreate, OrderResponse</code></td><td>Types the service's input and output contracts.</td></tr>
+        <tr><td>7</td><td><code>class OrderValidationService:</code></td><td>Groups order-validation business behavior outside the HTTP route, making it directly testable and replaceable.</td></tr>
+        <tr><td>8–9</td><td><code>def __init__(self, supported_currencies: Iterable[str]) -&gt; None:<br>&nbsp;&nbsp;self._supported_currencies = frozenset(supported_currencies)</code></td><td>Copies configuration into an immutable set. The leading underscore marks it as an internal implementation detail.</td></tr>
+        <tr><td>11–14</td><td><code>def validate(self, order: OrderCreate) -&gt; OrderResponse:<br>&nbsp;&nbsp;if order.currency not in self._supported_currencies:<br>&nbsp;&nbsp;&nbsp;&nbsp;raise UnsupportedCurrencyError(order.currency)<br>&nbsp;&nbsp;return OrderResponse(**order.model_dump())</code></td><td>Applies the business rule, then turns the validated input model into the output model. <code>model_dump()</code> creates a dictionary; <code>**</code> passes its keys as constructor arguments; <code>accepted</code> uses its default <code>True</code>.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="dependencies">
+    <h2><code>app/api/dependencies.py</code> — object assembly at the HTTP boundary</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from typing import Annotated</code></td><td>Lets a type carry extra FastAPI metadata without hiding the underlying Python type.</td></tr>
+        <tr><td>3</td><td><code>from fastapi import Depends</code></td><td>Marks a callable that FastAPI should execute to obtain a parameter value.</td></tr>
+        <tr><td>5–6</td><td><code>from app.core.config import Settings, get_settings<br>from app.services.order_validation import OrderValidationService</code></td><td>Imports the object types and providers that this module connects.</td></tr>
+        <tr><td>9</td><td><code>SettingsDependency = Annotated[Settings, Depends(get_settings)]</code></td><td>Creates a reusable alias: type checkers see <code>Settings</code>; FastAPI sees “call <code>get_settings</code>.” It removes repeated dependency syntax from routes.</td></tr>
+        <tr><td>12–15</td><td><code>def get_order_validation_service(<br>&nbsp;&nbsp;settings: SettingsDependency,<br>) -&gt; OrderValidationService:<br>&nbsp;&nbsp;return OrderValidationService(settings.supported_currencies)</code></td><td>A dependency provider with its own dependency. FastAPI first resolves settings, then constructs the service with configuration. This is a small dependency graph.</td></tr>
+        <tr><td>18–21</td><td><code>OrderValidationServiceDependency = Annotated[<br>&nbsp;&nbsp;OrderValidationService,<br>&nbsp;&nbsp;Depends(get_order_validation_service),<br>]</code></td><td>Creates the reusable service alias used in routes. Tests can override the provider to inject a fake service.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="orders">
+    <h2><code>app/api/orders.py</code> — HTTP routes</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from fastapi import APIRouter, File, Query, UploadFile, status</code></td><td>Imports route grouping, parameter declarations, uploaded-file support, and readable HTTP status constants.</td></tr>
+        <tr><td>3</td><td><code>from app.api.dependencies import OrderValidationServiceDependency, SettingsDependency</code></td><td>Routes request already-assembled collaborators rather than constructing them inline.</td></tr>
+        <tr><td>4–9</td><td><code>from app.core.exceptions import (...)</code></td><td>Imports the particular application failures these endpoints may raise directly.</td></tr>
+        <tr><td>10–17</td><td><code>store_upload</code>, <code>ImportResponse</code>, and order schema imports</td><td>Brings in core behavior and the request/response contracts used in route signatures and decorators.</td></tr>
+        <tr><td>19</td><td><code>router = APIRouter()</code></td><td>Creates a modular route registry. <code>main.py</code> later includes it in the actual app.</td></tr>
+        <tr><td>20</td><td><code>ORDERS: dict[str, OrderResponse] = {}</code></td><td>An in-memory fake database keyed by order ID. It is suitable for learning/tests, but data disappears on restart and is neither multi-process-safe nor durable.</td></tr>
+        <tr><td>23–25</td><td><code>@router.get("/health/live")<br>def liveness() -&gt; dict[str, str]:<br>&nbsp;&nbsp;return {"status": "ok"}</code></td><td>Registers a synchronous GET health handler. Liveness deliberately checks only whether the process can answer, so orchestration can decide whether to restart it.</td></tr>
+        <tr><td>28–31</td><td><code>@router.get("/health/ready")<br>def readiness(settings: SettingsDependency) …<br>&nbsp;&nbsp;upload_dir = …<br>&nbsp;&nbsp;output_dir = …</code></td><td>Registers readiness and injects settings. Local variables shorten the repeated checks below.</td></tr>
+        <tr><td>33–42</td><td><code>upload_ok = (... st_mode &amp; 0o222)<br>output_ok = (... st_mode &amp; 0o222)</code></td><td>Each expression requires the path to exist, be a directory, and have at least one write permission bit. <code>0o222</code> is the owner/group/other write-bit mask. It checks mode bits, not an actual write attempt or all OS access rules.</td></tr>
+        <tr><td>44–47</td><td><code>if not upload_ok: raise …<br>if not output_ok: raise …</code></td><td>Readiness fails with the precise unavailable directory. The global handler turns the error into HTTP 503 JSON.</td></tr>
+        <tr><td>49–53</td><td><code>return {"status": "ready", ...}</code></td><td>Returns operational status plus string paths, which are JSON serializable.</td></tr>
+        <tr><td>56–60</td><td><code>@router.post(<br>&nbsp;&nbsp;"/orders",<br>&nbsp;&nbsp;response_model=OrderResponse,<br>&nbsp;&nbsp;status_code=status.HTTP_201_CREATED,<br>)</code></td><td>Registers order creation, documents/filters output as <code>OrderResponse</code>, and selects 201 Created instead of the default 200.</td></tr>
+        <tr><td>61–66</td><td><code>def create_order(order: OrderCreate) -&gt; OrderResponse:<br>&nbsp;&nbsp;if order.order_id in ORDERS: …<br>&nbsp;&nbsp;response = OrderResponse(**order.model_dump())<br>&nbsp;&nbsp;ORDERS[...] = response<br>&nbsp;&nbsp;return response</code></td><td>FastAPI parses the JSON body into <code>OrderCreate</code>. The route prevents duplicate keys, creates the response, stores it in memory, and returns it. This route does <em>not</em> call the currency-validation service.</td></tr>
+        <tr><td>69–73</td><td><code>@router.post("/orders/validate", response_model=OrderResponse, status_code=200)</code></td><td>Registers a separate validation endpoint with an explicit response contract.</td></tr>
+        <tr><td>74–78</td><td><code>def validate_order(order: OrderCreate, service: OrderValidationServiceDependency) -&gt; OrderResponse:<br>&nbsp;&nbsp;return service.validate(order)</code></td><td>FastAPI obtains one parameter from the request body and one from dependency injection. The thin route delegates the business decision to the service.</td></tr>
+        <tr><td>81–86</td><td><code>@router.get("/orders/{order_id}", ...)<br>def get_order(order_id: str) …<br>&nbsp;&nbsp;order = ORDERS.get(order_id)<br>&nbsp;&nbsp;if order is None: raise …<br>&nbsp;&nbsp;return order</code></td><td><code>{order_id}</code> makes a path parameter. <code>dict.get</code> avoids <code>KeyError</code>; missing data becomes the API's stable 404 error.</td></tr>
+        <tr><td>89–96</td><td><code>@router.get("/orders", response_model=list[OrderResponse])<br>def list_orders(order_status: OrderStatus | None = Query(default=None, alias="status")) …</code></td><td>Returns all orders or filters by an optional query parameter named <code>status</code>. The Python variable is <code>order_status</code> for clarity; the enum validates accepted query values. A list copy avoids exposing the dictionary's live values view.</td></tr>
+        <tr><td>99–105</td><td><code>@router.post("/orders/checkout", response_model=CheckoutOrderRequest, status_code=201)<br>def create_checkout_order(payload: CheckoutOrderRequest):<br>&nbsp;&nbsp;return payload</code></td><td>A validation/echo endpoint: Pydantic validates the body, then the same model is returned. There is no checkout business logic or return annotation yet.</td></tr>
+        <tr><td>108–112</td><td><code>@router.post("/imports", response_model=ImportResponse, status_code=202)</code></td><td>Registers an asynchronous import-acceptance endpoint. 202 Accepted signals that work is queued/not complete, although no queue worker exists yet.</td></tr>
+        <tr><td>113–116</td><td><code>async def import_orders(<br>&nbsp;&nbsp;settings: SettingsDependency,<br>&nbsp;&nbsp;file: UploadFile = File(...),<br>) -&gt; ImportResponse:</code></td><td>Settings are injected; <code>File(...)</code> makes the multipart field required; <code>UploadFile</code> offers async chunk reads and spooled storage. The function is async because it awaits file reads.</td></tr>
+        <tr><td>117</td><td><code>media_type = (file.content_type or "").split(";", 1)[0].strip().lower()</code></td><td>Normalizes a possibly missing content type, discards parameters such as charset, trims whitespace, and lowercases it for reliable lookup.</td></tr>
+        <tr><td>118–122</td><td><code>suffix_by_type = {...}<br>suffix = suffix_by_type.get(media_type)</code></td><td>Acts as both an allow-list and safe extension mapping. Crucially, the client-supplied filename is not trusted for the storage path.</td></tr>
+        <tr><td>123–127</td><td><code>if suffix is None:<br>&nbsp;&nbsp;raise UnsupportedMediaTypeError(...)</code></td><td>Rejects everything outside JSON/NDJSON with HTTP 415 and records what the client declared.</td></tr>
+        <tr><td>129</td><td><code>result = await store_upload(file, settings, suffix=suffix)</code></td><td>Delegates chunking, limits, hashing, safe naming, cleanup, and finalization to core infrastructure.</td></tr>
+        <tr><td>131–137</td><td><code>return ImportResponse(..., state="queued")</code></td><td>Converts the internal dataclass to the public response schema and declares an initial state. This endpoint stores the bytes only; it does not invoke either parser.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="upload">
+    <h2><code>app/core/import_service.py</code> — safe, bounded upload storage</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from __future__ import annotations</code></td><td>Defers evaluation of annotations. This improves forward-reference behavior and avoids some runtime annotation costs; on this file's current simple types it is mostly defensive.</td></tr>
+        <tr><td>3–9</td><td><code>asyncio, hashlib, os, uuid, dataclass, Path, Protocol</code></td><td>Imports async thread offloading, SHA-256 hashing, atomic replacement, unique IDs, a compact result record, path typing, and structural typing.</td></tr>
+        <tr><td>11–16</td><td><code>Settings</code> and three upload exceptions</td><td>Imports configuration and the exact failures this storage operation can produce.</td></tr>
+        <tr><td>19–24</td><td><code>@dataclass(frozen=True)<br>class ImportResult:<br>&nbsp;&nbsp;import_id: str<br>&nbsp;&nbsp;checksum: str<br>&nbsp;&nbsp;stored_filename: str<br>&nbsp;&nbsp;bytes_received: int</code></td><td>Creates an immutable internal result object with generated equality/repr/init methods. It is not a web schema; that separation prevents core code from depending on FastAPI response concerns.</td></tr>
+        <tr><td>27–28</td><td><code>class AsyncReadable(Protocol):<br>&nbsp;&nbsp;async def read(self, size: int = -1) -&gt; bytes: ...</code></td><td>Defines the smallest interface the function needs. Any object with a compatible async <code>read</code> method works, including <code>UploadFile</code> and test doubles.</td></tr>
+        <tr><td>31–36</td><td><code>async def store_upload(source: AsyncReadable, settings: Settings, *, suffix: str) -&gt; ImportResult:</code></td><td>Declares an async storage operation. The <code>*</code> makes <code>suffix</code> keyword-only, avoiding ambiguous calls.</td></tr>
+        <tr><td>37</td><td><code>import_id = uuid.uuid4().hex</code></td><td>Generates a random 32-character hexadecimal ID, avoiding collisions and untrusted client filenames.</td></tr>
+        <tr><td>38–40</td><td><code>filename = ...<br>destination = ...<br>temporary = ... ".part"</code></td><td>Builds the final path and a hidden partial path. Writing the temporary file first prevents incomplete files from looking complete.</td></tr>
+        <tr><td>41–42</td><td><code>sha256 = hashlib.sha256()<br>total = 0</code></td><td>Creates an incremental checksum and byte counter, so neither requires loading the full upload into memory.</td></tr>
+        <tr><td>44–46</td><td><code>try:<br>&nbsp;&nbsp;...mkdir(parents=True, exist_ok=True)<br>&nbsp;&nbsp;with temporary.open("xb") as handle:</code></td><td>The try block guarantees cleanup. <code>parents=True</code> creates missing parents; <code>exist_ok=True</code> tolerates an existing directory. Mode <code>xb</code> means exclusive binary creation, preventing accidental overwrite.</td></tr>
+        <tr><td>47–50</td><td><code>while True:<br>&nbsp;&nbsp;chunk = await source.read(settings.upload_chunk_bytes)<br>&nbsp;&nbsp;if not chunk:<br>&nbsp;&nbsp;&nbsp;&nbsp;break</code></td><td>Reads bounded chunks until the source returns empty bytes, the conventional end-of-file signal.</td></tr>
+        <tr><td>51–57</td><td><code>chunk_len = len(chunk)<br>if total + chunk_len &gt; maximum:<br>&nbsp;&nbsp;raise UploadTooLargeError(...)</code></td><td>Checks the prospective total before writing the chunk, so the stored partial never exceeds the configured application limit.</td></tr>
+        <tr><td>58</td><td><code>await asyncio.to_thread(handle.write, chunk)</code></td><td>Moves the blocking filesystem write to a worker thread so the event-loop thread can serve other tasks while disk I/O waits.</td></tr>
+        <tr><td>59–60</td><td><code>sha256.update(chunk)<br>total += chunk_len</code></td><td>Updates integrity metadata only after the write succeeds, keeping checksum/count aligned with successfully written data.</td></tr>
+        <tr><td>61–62</td><td><code>if total == 0:<br>&nbsp;&nbsp;raise EmptyUploadError(...)</code></td><td>Rejects an empty stream after the file handle closes.</td></tr>
+        <tr><td>63</td><td><code>os.replace(temporary, destination)</code></td><td>Atomically publishes the completed file on the same filesystem: readers see either no final file or the complete final file.</td></tr>
+        <tr><td>64–69</td><td><code>except UploadTooLargeError: ...<br>except EmptyUploadError: ...</code></td><td>Deletes the partial file and re-raises the original known application error unchanged. <code>missing_ok=True</code> makes cleanup idempotent.</td></tr>
+        <tr><td>70–72</td><td><code>except OSError as exc:<br>&nbsp;&nbsp;...<br>&nbsp;&nbsp;raise UploadStorageError(...) from exc</code></td><td>Translates low-level filesystem failures into a stable public error while preserving the original exception as the cause for debugging.</td></tr>
+        <tr><td>73–75</td><td><code>except BaseException:<br>&nbsp;&nbsp;temporary.unlink(missing_ok=True)<br>&nbsp;&nbsp;raise</code></td><td>Cleans up on any other interruption, including cancellation, then propagates it. Catching <code>BaseException</code> is unusually broad but intentional for cleanup.</td></tr>
+        <tr><td>77–82</td><td><code>return ImportResult(...)</code></td><td>Returns immutable metadata only after finalization. <code>hexdigest()</code> renders the SHA-256 digest as a portable hexadecimal string.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="storage">
+    <h2><code>app/core/storage.py</code> — directory checks</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1–2</td><td><code>Settings</code> and <code>StorageDirectoryUnavailableError</code> imports</td><td>Imports the configuration shape and the stable failure used by this helper.</td></tr>
+        <tr><td>5</td><td><code>def ensure_storage_directories(settings: Settings) -&gt; None:</code></td><td>Defines a reusable synchronous startup/storage check. It is currently not called; <code>main.py</code> duplicates only the directory creation part.</td></tr>
+        <tr><td>6</td><td><code>for directory in (settings.upload_directory, settings.output_directory):</code></td><td>Applies the same checks to both paths without duplicate code.</td></tr>
+        <tr><td>7</td><td><code>directory.mkdir(parents=True, exist_ok=True)</code></td><td>Creates the directory tree if absent.</td></tr>
+        <tr><td>8–9</td><td><code>if not directory.exists() or not directory.is_dir():<br>&nbsp;&nbsp;raise ...</code></td><td>Rejects a path that still does not exist or points to something other than a directory.</td></tr>
+        <tr><td>10–11</td><td><code>if not (directory.stat().st_mode &amp; 0o222):<br>&nbsp;&nbsp;raise ...</code></td><td>Checks whether any write permission bit is present. Like readiness, this is a mode-bit approximation, not a guaranteed writeability test.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="main">
+    <h2><code>app/main.py</code> — application assembly and cross-cutting behavior</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1–3</td><td><code>asynccontextmanager</code>, <code>perf_counter</code>, <code>uuid4</code></td><td>Imports the lifespan adapter, a high-resolution monotonic timer, and random request-ID generation.</td></tr>
+        <tr><td>5–8</td><td><code>FastAPI</code>, <code>Request</code>, <code>JSONResponse</code>, <code>MutableHeaders</code>, ASGI types</td><td>Imports app assembly and the lower-level Starlette/ASGI tools needed for custom middleware and responses.</td></tr>
+        <tr><td>10–12</td><td><code>router</code>, <code>get_settings</code>, <code>ApplicationError</code></td><td>Imports the three application-level pieces assembled here: routes, configuration, and global error family.</td></tr>
+        <tr><td>15–16</td><td><code>@asynccontextmanager<br>async def lifespan(app: FastAPI):</code></td><td>Converts an async generator into FastAPI's startup/shutdown context. The <code>app</code> argument is required by the interface but unused.</td></tr>
+        <tr><td>17–19</td><td><code>settings = get_settings()<br>...mkdir(... upload ...)<br>...mkdir(... output ...)</code></td><td>Runs once before serving requests and ensures storage directories exist. Failures here stop startup rather than yielding a half-ready app.</td></tr>
+        <tr><td>20</td><td><code>yield</code></td><td>Marks the boundary: code before it is startup; code after it would be shutdown. There is currently no shutdown cleanup.</td></tr>
+        <tr><td>23–27</td><td><code>app = FastAPI(title=..., version="0.2.0", lifespan=lifespan)</code></td><td>Creates the ASGI application. The title/version feed OpenAPI docs; lifespan installs startup behavior.</td></tr>
+        <tr><td>28</td><td><code>app.include_router(router)</code></td><td>Copies all operations registered on the modular router into the main application.</td></tr>
+        <tr><td>31–33</td><td><code>class RequestContextMiddleware:<br>&nbsp;&nbsp;def __init__(self, app: ASGIApp) -&gt; None:<br>&nbsp;&nbsp;&nbsp;&nbsp;self.app = app</code></td><td>Defines pure ASGI middleware and stores the next application in the middleware chain.</td></tr>
+        <tr><td>35–40</td><td><code>async def __call__(self, scope, receive, send) -&gt; None:</code></td><td>Makes each middleware instance an ASGI callable. <code>scope</code> is connection/request metadata; <code>receive</code> supplies incoming events; <code>send</code> emits outgoing events.</td></tr>
+        <tr><td>41–43</td><td><code>if scope["type"] != "http":<br>&nbsp;&nbsp;await self.app(scope, receive, send)<br>&nbsp;&nbsp;return</code></td><td>Passes WebSocket/lifespan traffic through untouched. HTTP-only assumptions below would be invalid for other ASGI scope types.</td></tr>
+        <tr><td>45</td><td><code>incoming_headers = dict(scope.get("headers", []))</code></td><td>Turns ASGI's list of byte pairs into a dictionary for lookup. Duplicate headers would collapse, which is acceptable for this single request-ID header.</td></tr>
+        <tr><td>46–47</td><td><code>request_id = ...decode("latin-1")<br>request_id = request_id or f"req_{uuid4().hex}"</code></td><td>Reuses a caller's <code>X-Request-ID</code> or creates one. Latin-1 maps header bytes losslessly; the prefix makes generated IDs recognizable.</td></tr>
+        <tr><td>48</td><td><code>scope.setdefault("state", {})["request_id"] = request_id</code></td><td>Stores correlation state in the ASGI scope so FastAPI exposes it as <code>request.state.request_id</code> to the error handler.</td></tr>
+        <tr><td>49</td><td><code>started = perf_counter()</code></td><td>Captures a monotonic start time appropriate for elapsed-duration measurement.</td></tr>
+        <tr><td>51</td><td><code>async def add_response_headers(message: Message) -&gt; None:</code></td><td>Creates a closure that can see <code>started</code>, <code>request_id</code>, and the original <code>send</code>. It wraps outbound ASGI messages.</td></tr>
+        <tr><td>52–55</td><td><code>if message["type"] == "http.response.start":<br>&nbsp;&nbsp;headers = MutableHeaders(scope=message)<br>&nbsp;&nbsp;headers["X-Process-Time"] = ...<br>&nbsp;&nbsp;headers["X-Request-ID"] = request_id</code></td><td>Mutates headers exactly when the response status/headers event is emitted. Processing time is formatted to six decimals; request ID is echoed on every HTTP response.</td></tr>
+        <tr><td>56</td><td><code>await send(message)</code></td><td>Always forwards the possibly modified message to the real server. Without this, responses would stall.</td></tr>
+        <tr><td>58</td><td><code>await self.app(scope, receive, add_response_headers)</code></td><td>Calls the downstream app with the original incoming channel and wrapped outgoing channel.</td></tr>
+        <tr><td>61</td><td><code>app.add_middleware(RequestContextMiddleware)</code></td><td>Installs the middleware around the application.</td></tr>
+        <tr><td>64–68</td><td><code>@app.exception_handler(ApplicationError)<br>async def application_error_handler(request: Request, exc: ApplicationError) -&gt; JSONResponse:</code></td><td>Registers one handler for the base exception, so all subclasses get the same response envelope. FastAPI supplies the request and thrown exception.</td></tr>
+        <tr><td>69–79</td><td><code>return JSONResponse(status_code=exc.status_code, content={...})</code></td><td>Bypasses ordinary response-model conversion to explicitly return the subclass's HTTP status and a stable error object. It includes the middleware-generated request ID for support/debug correlation.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="parsers">
+    <h2><code>app/core/parsers.py</code> — record-at-a-time parsing</h2>
+    <div class="warning callout"><strong>Status:</strong> this module is not connected to <code>POST /imports</code>. The route only stores bytes. The current NDJSON test also expects a different “outcome per line” contract, so the parser test fails. Read this section as “what the code currently attempts,” not as proven production behavior.</div>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1–12</td><td><code>"""Record-at-a-time import parsers. ..."""</code></td><td>The module docstring states the design goal: stream NDJSON or a top-level JSON array without holding the full dataset, while limiting individual records.</td></tr>
+        <tr><td>14</td><td><code>from __future__ import annotations</code></td><td>Defers runtime evaluation of type annotations.</td></tr>
+        <tr><td>16–20</td><td><code>json</code>, <code>Iterable</code>, <code>Iterator</code>, <code>JSONDecodeError</code>, <code>ApplicationError</code></td><td>Imports JSON decoding, streaming-oriented abstract types, the precise parse failure, and the app's common error base.</td></tr>
+        <tr><td>23–28</td><td><code>class RecordTooLargeError(ApplicationError): … 413<br>def __init__(...): super().__init__(...)</code></td><td>Defines a parser-specific size error that participates in the global error envelope. Its initializer merely preserves a more precise type signature.</td></tr>
+        <tr><td>31–36</td><td><code>class InvalidJsonError(ApplicationError): … 400<br>def __init__(...): super().__init__(message, details=details or {})</code></td><td>Defines malformed JSON as a client error and normalizes missing details.</td></tr>
+        <tr><td>39–43</td><td><code>def iter_ndjson(lines: Iterable[bytes], *, maximum_record_bytes: int) -&gt; Iterator[object]:</code></td><td>Accepts any iterable of byte lines, requires the limit by keyword, and lazily yields arbitrary decoded JSON values.</td></tr>
+        <tr><td>44–48</td><td><code>"""Yield one parsed JSON record ..."""</code></td><td>Documents the intended per-line behavior and that size is checked before decoding.</td></tr>
+        <tr><td>49–52</td><td><code>for line in lines:<br>&nbsp;&nbsp;stripped = line.strip()<br>&nbsp;&nbsp;if not stripped:<br>&nbsp;&nbsp;&nbsp;&nbsp;continue</code></td><td>Processes lazily, removes surrounding whitespace, and ignores blank lines.</td></tr>
+        <tr><td>53–58</td><td><code>if len(stripped) &gt; maximum_record_bytes:<br>&nbsp;&nbsp;raise RecordTooLargeError(...)</code></td><td>Rejects an oversized raw record before allocating a decoded object. Details report the actual byte count.</td></tr>
+        <tr><td>59–65</td><td><code>try:<br>&nbsp;&nbsp;yield json.loads(stripped)<br>except JSONDecodeError as exc:<br>&nbsp;&nbsp;raise InvalidJsonError(...) from exc</code></td><td>Decodes and yields one value. On malformed JSON it stops iteration by raising a stable error; this directly conflicts with the current test's expectation to yield an error outcome and continue.</td></tr>
+        <tr><td>68–72</td><td><code>def iter_json_array(chunks: Iterable[bytes], *, maximum_record_bytes: int) -&gt; Iterator[object]:</code></td><td>Defines a lazy adapter over arbitrary byte chunks rather than lines.</td></tr>
+        <tr><td>73–80</td><td><code>"""Stream elements ..."""</code></td><td>Documents the intended bounded-memory, top-level-array-only contract.</td></tr>
+        <tr><td>81–86</td><td><code>parser = _IncrementalArrayParser(...)<br>for chunk in chunks:<br>&nbsp;&nbsp;for record in parser.feed(chunk): yield record<br>for record in parser.finish(): yield record</code></td><td>Hides the mutable parser behind a generator API: feed all chunks, yield completed elements immediately, then finalize end-of-input.</td></tr>
+        <tr><td>89</td><td><code># -- incremental array-element splitter --</code></td><td>A visual section divider; comments have no runtime effect.</td></tr>
+        <tr><td>91–101</td><td><code>class _IncrementalArrayParser:</code> and docstring</td><td>The leading underscore marks a private helper. Its docstring describes a scanner that tracks strings and bracket depth, then delegates each isolated element to <code>json.loads</code>.</td></tr>
+        <tr><td>103–113</td><td><code>def __init__(...):</code> and eleven state assignments</td><td>Initializes the maximum size, mutable byte buffer, top-level-array flag, nesting depth, current element start/depth/type, string/escape state, and completion flag. These fields form a state machine carried across chunks.</td></tr>
+        <tr><td>115–117</td><td><code>def feed(self, chunk: bytes) -&gt; list[object]:<br>&nbsp;&nbsp;self._buffer.extend(chunk)<br>&nbsp;&nbsp;return self._scan()</code></td><td>Appends bytes without replacing previously incomplete data, then scans for all newly completed records.</td></tr>
+        <tr><td>119–129</td><td><code>def finish(self) ...</code></td><td>Runs a final scan and returns emitted records. Lines 126–129 mark a missing closing bracket as done rather than raising an error; this behavior does not match the comment and is a correctness concern.</td></tr>
+        <tr><td>131–135</td><td><code>def _scan(self, *, final: bool = False) ...<br>records = []<br>b = self._buffer<br>i = 0<br>n = len(b)</code></td><td>Starts a scanning pass, aliases the buffer for shorter access, and uses indices over the current byte count. <code>final</code> is accepted but never read, another sign the implementation is incomplete.</td></tr>
+        <tr><td>136–138</td><td><code>while i &lt; n:<br>&nbsp;&nbsp;ch = b[i]</code></td><td>Walks one byte at a time. Indexing a <code>bytearray</code> returns an integer byte value.</td></tr>
+        <tr><td>139–148</td><td><code>if not self._array_seen: ...</code></td><td>Skips leading JSON whitespace, requires byte <code>[</code> as the first token, then marks top-level depth 1. <code>ord(b"[")</code> converts a one-byte value into the integer representation used by indexing.</td></tr>
+        <tr><td>150–163</td><td><code>if self._depth == 1 and self._start is None: ...</code></td><td>While between elements, skips whitespace and commas, recognizes <code>]</code>, or records the next element's starting index and whether it begins with an object/array. The code accepts repeated/leading commas, which strict JSON should reject.</td></tr>
+        <tr><td>165–174</td><td><code>if self._in_string: ...</code></td><td>Inside a string, one byte after a backslash is treated as escaped, a backslash starts escape mode, and an unescaped quote ends string mode. All other bytes are ignored structurally.</td></tr>
+        <tr><td>176–179</td><td><code>if ch == ord(b'"'):<br>&nbsp;&nbsp;self._in_string = True<br>&nbsp;&nbsp;i += 1<br>&nbsp;&nbsp;continue</code></td><td>Enters string mode so braces, brackets, and commas inside text are not mistaken for structure.</td></tr>
+        <tr><td>181–184</td><td><code>if ch in b"{[":<br>&nbsp;&nbsp;self._depth += 1<br>&nbsp;&nbsp;...</code></td><td>Increases nesting depth for an opening object/array encountered during scanning.</td></tr>
+        <tr><td>186–195</td><td><code>if ch in b"}]":<br>&nbsp;&nbsp;self._depth -= 1<br>&nbsp;&nbsp;if self._open ...:<br>&nbsp;&nbsp;&nbsp;&nbsp;self._emit(records, i + 1)<br>&nbsp;&nbsp;...</code></td><td>Decreases depth and tries to emit a bracketed element when it returns to the element's starting depth. However, line 162 skipped counting the element's first opening bracket, so ordinary object/array elements do not satisfy this comparison correctly.</td></tr>
+        <tr><td>197–205</td><td><code>if (self._start is not None and not self._open and self._depth == 1 and ch in b",]"):<br>&nbsp;&nbsp;self._emit(records, i)<br>&nbsp;&nbsp;continue</code></td><td>For scalar elements—numbers, booleans, null, or strings—a comma or closing bracket ends the byte slice. It does not consume the delimiter here; the next loop pass handles it as between-elements structure.</td></tr>
+        <tr><td>207</td><td><code>i += 1</code></td><td>Advances past an ordinary non-structural byte.</td></tr>
+        <tr><td>209–218</td><td><code># Compact ...<br>if self._start is not None:<br>&nbsp;&nbsp;del b[: self._start]<br>&nbsp;&nbsp;self._start = 0<br>else:<br>&nbsp;&nbsp;keep = min(len(b), 4)<br>&nbsp;&nbsp;del b[: max(0, len(b) - keep)]<br>return records</code></td><td>Attempts to discard processed bytes. If an element is incomplete it preserves bytes from its start; otherwise it keeps four trailing bytes. Because the next call restarts <code>i</code> at zero while retaining depth/string state, preserved bytes may be processed twice across chunks—another correctness issue.</td></tr>
+        <tr><td>220–223</td><td><code>def _emit(...):<br>&nbsp;&nbsp;b = self._buffer<br>&nbsp;&nbsp;start = self._start<br>&nbsp;&nbsp;record_bytes = bytes(b[start:end]).rstrip()</code></td><td>Extracts the current element as immutable bytes and removes trailing whitespace. Static typing would note that <code>start</code> is optional, though callers intend it to be an integer.</td></tr>
+        <tr><td>224–226</td><td><code>if not record_bytes: raise ...<br>self._check_size(len(record_bytes))</code></td><td>Rejects empty elements and enforces the per-record cap. The check occurs only when a delimiter is found, so a never-terminated giant element can still grow the buffer beyond the claimed bound.</td></tr>
+        <tr><td>227–233</td><td><code>try: records.append(json.loads(record_bytes))<br>except JSONDecodeError ...</code></td><td>Uses the standard decoder for final semantic validation and translates its failure into the application error family.</td></tr>
+        <tr><td>234–238</td><td><code># Mark ...<br>self._start = None<br>self._open = False<br>self._start_depth = None</code></td><td>Resets element-specific state but postpones buffer deletion to avoid changing indexes during the scan loop.</td></tr>
+        <tr><td>240–246</td><td><code>def _check_size(self, size: int) -&gt; None:<br>&nbsp;&nbsp;if size &gt; self._max:<br>&nbsp;&nbsp;&nbsp;&nbsp;raise RecordTooLargeError(...)</code></td><td>Centralizes the JSON-array element size error and includes the measured byte count.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="sample">
+    <h2><code>app/day-04_sample.py</code> — detached streaming experiment</h2>
+    <table>
+      <thead><tr><th>Lines</th><th>Code</th><th>What / why here</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><code>from collections.abc import AsyncIterable</code></td><td>Imports a return type representing values produced asynchronously over time.</td></tr>
+        <tr><td>3–4</td><td><code>from fastapi import FastAPI<br>from pydantic import BaseModel</code></td><td>Imports a completely separate FastAPI app and its data model base.</td></tr>
+        <tr><td>6</td><td><code>app = FastAPI()</code></td><td>Creates an independent application. It is not imported or mounted by <code>app/main.py</code>; it would need its own Uvicorn target.</td></tr>
+        <tr><td>9–11</td><td><code>class Item(BaseModel):<br>&nbsp;&nbsp;name: str<br>&nbsp;&nbsp;description: str | None</code></td><td>Defines an item. Despite allowing <code>None</code>, <code>description</code> is required because it has no default <code>= None</code>.</td></tr>
+        <tr><td>14–18</td><td><code>items = [Item(...), Item(...), Item(...)]</code></td><td>Creates three validated in-memory sample objects at module import time.</td></tr>
+        <tr><td>21–24</td><td><code>@app.get("/items/stream")<br>async def stream_items() -&gt; AsyncIterable[Item]:<br>&nbsp;&nbsp;for item in items:<br>&nbsp;&nbsp;&nbsp;&nbsp;yield item</code></td><td>Defines an async generator, but merely yielding Pydantic objects is not the normal FastAPI streaming-response contract. A real streaming endpoint generally returns <code>StreamingResponse</code> with serialized byte/string chunks and a media type. Treat this file as an experiment, not part of the main API.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section id="findings">
+    <h2>Important findings the line-by-line view reveals</h2>
+    <ol>
+      <li><strong>The active import endpoint stores but does not parse.</strong> It returns <code>state="queued"</code>, but there is no queue or worker connected yet.</li>
+      <li><strong>The parser contract and its test disagree.</strong> The implementation raises on malformed NDJSON; the test expects an outcome object and continued processing.</li>
+      <li><strong>The incremental JSON-array parser has correctness risks.</strong> Opening-depth accounting, rescanning preserved bytes, end-of-input validation, comma validation, and early size enforcement need tests/fixes before use.</li>
+      <li><strong>Creation and validation are inconsistent.</strong> <code>POST /orders/validate</code> checks supported currency, while <code>POST /orders</code> does not.</li>
+      <li><strong>Several pieces are planned but unused.</strong> <code>environment</code>, telemetry settings, progress interval, <code>ImportNotFoundError</code>, and <code>ensure_storage_directories</code> do not affect current requests.</li>
+      <li><strong>Storage is demonstrational.</strong> The global <code>ORDERS</code> dictionary is erased on restart and does not coordinate across multiple workers.</li>
+    </ol>
+  </section>
+
+  <footer>
+    <p>Primary references: <a href="https://fastapi.tiangolo.com/tutorial/dependencies/">dependencies</a>, <a href="https://fastapi.tiangolo.com/advanced/events/">lifespan</a>, <a href="https://fastapi.tiangolo.com/tutorial/request-files/">uploads</a>, <a href="https://fastapi.tiangolo.com/tutorial/response-model/">response models</a>, <a href="https://fastapi.tiangolo.com/tutorial/handling-errors/">errors</a>, and <a href="https://docs.pydantic.dev/latest/concepts/pydantic_settings/">Pydantic settings</a>.</p>
+    <p>Ask your agent about any row that is unclear; the next useful exercise is tracing one concrete request without looking at the flow diagram.</p>
+  </footer>
+</main>
+</body>
+</html>

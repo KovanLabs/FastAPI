@@ -83,6 +83,285 @@ def test_import_stores_multipart_upload_and_returns_accepted_metadata(override_t
     assert summary_response.json()["accepted_records"] == 1
 
 
+def test_import_can_persist_an_upload_without_starting_the_pipeline(
+    override_test_settings,
+    client,
+) -> None:
+    response = client.post(
+        "/imports?auto_start=false",
+        files={
+            "file": (
+                "orders.json",
+                b"[]",
+                "application/json",
+            )
+        },
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["state"] == "uploaded"
+    assert client.get(f"/imports/{body['import_id']}").json()["state"] == "uploaded"
+    assert (
+        override_test_settings.upload_directory / body["stored_filename"]
+    ).read_bytes() == b"[]"
+    assert not (
+        override_test_settings.output_directory / body["import_id"]
+    ).exists()
+
+
+def test_uploaded_json_can_be_cleaned_without_running_an_adapter(
+    override_test_settings,
+    client,
+) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": " ord-1 ",
+                "customer_email": "USER@EXAMPLE.COM",
+                "amount": "10.005",
+                "currency": " inr ",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": " PENDING ",
+                "items": [{"sku": " sku-1 ", "quantity": 2}],
+            },
+            {"order_id": "missing-required-fields"},
+        ]
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.json", payload, "application/json")},
+    ).json()
+
+    response = client.post(f"/imports/{uploaded['import_id']}/clean")
+
+    assert response.status_code == 202
+    assert response.json()["state"] == "cleaning"
+    status = client.get(f"/imports/{uploaded['import_id']}").json()
+    assert status["state"] == "cleaned"
+    assert status["total_records"] == 2
+    assert status["accepted_records"] == 1
+    assert status["rejected_records"] == 1
+    job_directory = (
+        override_test_settings.output_directory / uploaded["import_id"]
+    )
+    assert (job_directory / "accepted.ndjson").is_file()
+    assert (job_directory / "rejected.ndjson").is_file()
+    assert (job_directory / "summary.json").is_file()
+    assert not (job_directory / "processed.ndjson").exists()
+
+
+def test_uploaded_canonical_ndjson_can_publish_cleaned_artifacts(
+    override_test_settings,
+    client,
+) -> None:
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={
+            "file": (
+                "orders.ndjson",
+                NDJSON_BODY.encode(),
+                "application/x-ndjson",
+            )
+        },
+    ).json()
+
+    response = client.post(f"/imports/{uploaded['import_id']}/clean")
+
+    assert response.status_code == 202
+    status = client.get(f"/imports/{uploaded['import_id']}").json()
+    assert status["state"] == "cleaned"
+    assert status["accepted_records"] == 1
+    assert status["rejected_records"] == 0
+    job_directory = (
+        override_test_settings.output_directory / uploaded["import_id"]
+    )
+    assert (job_directory / "accepted.ndjson").read_text(
+        encoding="utf-8"
+    ) == NDJSON_BODY
+    assert (job_directory / "rejected.ndjson").read_bytes() == b""
+
+
+def test_cleaned_import_can_be_processed_with_duckdb_without_loading(
+    override_test_settings,
+    client,
+) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": "ORD-1",
+                "customer_email": "user@example.com",
+                "amount": "10.00",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [
+                    {"sku": "SKU-1", "quantity": 2},
+                    {"sku": "SKU-2", "quantity": 3},
+                ],
+            }
+        ]
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.json", payload, "application/json")},
+    ).json()
+    import_id = uploaded["import_id"]
+    assert client.post(f"/imports/{import_id}/clean").status_code == 202
+
+    response = client.post(
+        f"/imports/{import_id}/process?engine=duckdb"
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "import_id": import_id,
+        "state": "processing",
+    }
+    assert client.get(f"/imports/{import_id}").json()["state"] == "processed"
+    job_directory = override_test_settings.output_directory / import_id
+    processed = json.loads(
+        (job_directory / "processed.ndjson").read_text(encoding="utf-8")
+    )
+    assert processed["item_count"] == 2
+    assert processed["total_quantity"] == 5
+    assert not (override_test_settings.output_directory / "imports.duckdb").exists()
+
+
+def test_processed_import_can_be_loaded_and_completed(
+    client,
+) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": "ORD-1",
+                "customer_email": "user@example.com",
+                "amount": "10.00",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [{"sku": "SKU-1", "quantity": 2}],
+            },
+            {"order_id": "missing-required-fields"},
+        ]
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.json", payload, "application/json")},
+    ).json()
+    import_id = uploaded["import_id"]
+    assert client.post(f"/imports/{import_id}/clean").status_code == 202
+    assert (
+        client.post(f"/imports/{import_id}/process?engine=duckdb").status_code
+        == 202
+    )
+
+    response = client.post(f"/imports/{import_id}/load")
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "import_id": import_id,
+        "state": "loading",
+    }
+    status = client.get(f"/imports/{import_id}").json()
+    assert status["state"] == "completed_with_errors"
+    assert status["accepted_records"] == 1
+    assert status["rejected_records"] == 1
+
+
+def test_cleaned_import_artifacts_can_be_downloaded(client) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": "ORD-1",
+                "customer_email": "user@example.com",
+                "amount": "10.00",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [{"sku": "SKU-1", "quantity": 1}],
+            }
+        ]
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.json", payload, "application/json")},
+    ).json()
+    import_id = uploaded["import_id"]
+    client.post(f"/imports/{import_id}/clean")
+
+    accepted = client.get(f"/imports/{import_id}/artifacts/accepted")
+    source = client.get(f"/imports/{import_id}/artifacts/source")
+    missing = client.get(f"/imports/{import_id}/artifacts/unknown")
+
+    assert accepted.status_code == 200
+    assert accepted.headers["content-type"].startswith(
+        "application/x-ndjson"
+    )
+    assert json.loads(accepted.text)["record_number"] == 1
+    assert source.status_code == 200
+    assert source.content == payload
+    assert missing.status_code == 422
+
+
+def test_retry_resumes_failed_processing_without_repeating_cleaning(
+    override_test_settings,
+    client,
+) -> None:
+    payload = json.dumps(
+        [
+            {
+                "order_id": "ORD-1",
+                "customer_email": "user@example.com",
+                "amount": "10.00",
+                "currency": "INR",
+                "ordered_at": "2026-10-05T04:30:00+00:00",
+                "status": "pending",
+                "items": [{"sku": "SKU-1", "quantity": 1}],
+            }
+        ]
+    ).encode()
+    uploaded = client.post(
+        "/imports?auto_start=false",
+        files={"file": ("orders.json", payload, "application/json")},
+    ).json()
+    import_id = uploaded["import_id"]
+    client.post(f"/imports/{import_id}/clean")
+    accepted_path = (
+        override_test_settings.output_directory
+        / import_id
+        / "accepted.ndjson"
+    )
+    accepted_before = accepted_path.read_bytes()
+    override_test_settings.maximum_record_bytes = 32
+    client.post(f"/imports/{import_id}/process?engine=duckdb")
+    failed = client.get(f"/imports/{import_id}").json()
+    assert failed["state"] == "failed"
+    assert failed["failure_code"] == "processing_failed"
+    assert failed["failed_stage"] == "processing"
+    assert failed["processing_engine"] == "duckdb"
+    assert failed["stage_attempt"] == 1
+
+    first_retry = client.post(f"/imports/{import_id}/retry?engine=polars")
+
+    assert first_retry.status_code == 202
+    failed_again = client.get(f"/imports/{import_id}").json()
+    assert failed_again["state"] == "failed"
+    assert failed_again["processing_engine"] == "duckdb"
+    assert failed_again["stage_attempt"] == 2
+
+    override_test_settings.maximum_record_bytes = 1024 * 1024
+    response = client.post(f"/imports/{import_id}/retry")
+
+    assert response.status_code == 202
+    assert response.json()["state"] == "processing"
+    completed_retry = client.get(f"/imports/{import_id}").json()
+    assert completed_retry["state"] == "processed"
+    assert completed_retry["processing_engine"] == "duckdb"
+    assert completed_retry["stage_attempt"] == 3
+    assert accepted_path.read_bytes() == accepted_before
+
+
 def test_import_status_reports_the_completed_background_job(client) -> None:
     response = client.post(
         "/imports",
@@ -106,6 +385,9 @@ def test_import_status_reports_the_completed_background_job(client) -> None:
         "rejected_records": 0,
         "failure_code": None,
         "failure_message": None,
+        "failed_stage": None,
+        "stage_attempt": 0,
+        "processing_engine": None,
     }
 
 
@@ -215,7 +497,7 @@ def test_import_artifacts_are_hidden_until_the_job_is_terminal(
 def test_import_rejects_wrong_content_type(client) -> None:
     response = client.post(
         "/imports",
-        files={"file": ("orders.csv", b"id,amount\n1,2", "text/csv")},
+        files={"file": ("orders.txt", b"not an order file", "text/plain")},
     )
     assert response.status_code == 415
 

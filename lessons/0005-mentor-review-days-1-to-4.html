@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mentor review — Days 1–4</title>
+  <link rel="stylesheet" href="../assets/course.css">
+  <style>
+    .day { display:grid; grid-template-columns:7rem 1fr; gap:1.2rem; margin:1.5rem 0; }
+    .day > strong { color:var(--accent); font:700 1rem/1.4 ui-sans-serif,sans-serif; }
+    .proof { font-variant-numeric:tabular-nums; }
+    @media (max-width:700px) { .day { grid-template-columns:1fr; gap:.2rem; } }
+  </style>
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 0005 · Review preparation</p>
+  <h1>Tell the story of Days 1–4</h1>
+  <p class="lede">The project evolved from a typed FastAPI endpoint into a bounded large-file ingestion foundation. The important result is the set of engineering boundaries you can now defend.</p>
+
+  <h2>Your 30-second opening</h2>
+  <div class="callout">
+    <p>“I am building an order-import API in stages. By Day 4, I had implemented typed API contracts, separated HTTP and business concerns, persisted uploads safely in bounded chunks, and compared whole-document parsing with incremental parsing using measured memory results. The central lesson has been that validation, upload, parsing, and processing are different stages, and each needs its own contract and failure handling.”</p>
+  </div>
+
+  <h2>The four-day progression</h2>
+  <section class="day">
+    <strong>Day 1<br>Contracts</strong>
+    <div>
+      <h3>What I studied</h3>
+      <p>FastAPI request locations, Pydantic models and nested types, response models, validation responses, status codes, and generated OpenAPI.</p>
+      <h3>What I implemented</h3>
+      <p>An order schema containing an ID, validated email, positive decimal amount, currency, datetime, status enum, and nested line items. I added order validation and CRUD-style routes, declared response models, and tested request bodies plus path, query, and header behavior.</p>
+      <h3>What I learned</h3>
+      <p>Schema validation answers “does this value have the declared shape and constraints?” Business validation answers questions such as “is this currency supported?” A response model is also an output boundary: it can prevent undeclared internal data from leaking.</p>
+      <p class="proof"><strong>Evidence:</strong> 20 focused tests passed.</p>
+    </div>
+  </section>
+
+  <section class="day">
+    <strong>Day 2<br>Boundaries</strong>
+    <div>
+      <h3>What I studied</h3>
+      <p>Application assembly, routing, dependency injection, settings, service objects, stable exceptions, middleware, request correlation, lifespan, and event-loop blocking.</p>
+      <h3>What I implemented</h3>
+      <p><code>main.py</code> assembles the application, middleware, lifespan, and global application-error handler. Routes live under <code>app/api</code>; an ordinary validation service lives under <code>app/services</code>; configuration and stable exceptions live under <code>app/core</code>. Dependencies construct the service at the FastAPI boundary.</p>
+      <h3>What I learned</h3>
+      <p>Dependency injection is valuable because business services remain ordinary Python and can be tested directly or replaced in route tests. I also measured that blocking work inside <code>async def</code> still blocks the event-loop thread: two blocking waits took about 0.305 seconds, while two awaited waits overlapped and took about 0.154 seconds.</p>
+    </div>
+  </section>
+
+  <section class="day">
+    <strong>Day 3<br>Uploads</strong>
+    <div>
+      <h3>What I studied</h3>
+      <p>Multipart uploads, <code>UploadFile</code>, bounded reads, byte limits, streaming checksums, safe paths, temporary files, atomic publication, and cleanup after failures.</p>
+      <h3>What I implemented</h3>
+      <p><code>POST /imports</code> accepts NDJSON or JSON, reads configured chunks, counts actual bytes, computes SHA-256 during the copy, stores under a generated identifier, and atomically replaces a temporary <code>.part</code> file only after success. Empty, oversized, interrupted, and failed writes remove partial files.</p>
+      <h3>What I learned</h3>
+      <p>Uploading and parsing are separate stages. Client filenames are metadata, not trusted paths. A size limit must be enforced while bytes arrive, not after loading the whole file. Temporary-write-then-rename prevents partially written files from looking complete.</p>
+      <p class="proof"><strong>Evidence:</strong> bounded reads stayed around 2 MiB of traced allocations for both 16 MiB and 64 MiB inputs; whole-file reads scaled to roughly 16 MiB and 64 MiB.</p>
+    </div>
+  </section>
+
+  <section class="day">
+    <strong>Day 4<br>Parsing</strong>
+    <div>
+      <h3>What I studied</h3>
+      <p>NDJSON versus top-level JSON arrays, syntax parsing versus record processing, iterators, generators, recovery boundaries, per-record limits, incremental parsers, and peak RSS measurement.</p>
+      <h3>What I implemented</h3>
+      <p>The NDJSON parser reads a bounded line, rejects oversized records, drains the rest of an oversized line, enforces UTF-8, distinguishes blanks, invalid JSON, and non-object values, then continues at the next line. The JSON-array path reads fixed chunks and incrementally extracts array elements. Summary consumers keep counters and bounded error samples.</p>
+      <h3>What I learned</h3>
+      <p>NDJSON provides a natural recovery boundary at each line; a malformed top-level JSON array can invalidate the remaining document. More importantly, an incremental parser does not guarantee bounded memory—the caller must process and release each result. Calling <code>list(iterator)</code> destroys that benefit.</p>
+      <p class="proof"><strong>Evidence:</strong> for 100,000 records, <code>json.load</code> peaked at 162.37 MiB, streaming <code>ijson.items</code> at 18.29 MiB, and materialized <code>ijson.items</code> at 177.79 MiB. Ten million records were counted at 18.51 MiB peak RSS on this machine.</p>
+    </div>
+  </section>
+
+  <h2>Architecture you should draw</h2>
+  <div class="flow">HTTP multipart request
+  → FastAPI route and media-type contract
+  → bounded upload storage + checksum + atomic rename
+  → format-specific parser (NDJSON or JSON array)
+  → one record/outcome at a time
+  → bounded summary counts and failure samples</div>
+  <p>Point out that Day 1 request validation and Day 4 import parsing are not the same thing. Imported records have not yet passed the planned Day 5 cleaner, Pydantic record schema, business rules, duplicate policy, or accepted/rejected writers.</p>
+
+  <h2>Five-minute live demo</h2>
+  <ol>
+    <li>Show <code>app/schemas/orders.py</code>: explain nested schemas and the difference between type constraints and supported-currency business policy.</li>
+    <li>Show <code>app/api/dependencies.py</code> and <code>app/services/order_validation.py</code>: explain why the service is framework-independent.</li>
+    <li>Show <code>app/core/import_service.py</code>: trace one chunk through byte counting, hashing, temporary storage, and atomic replacement.</li>
+    <li>Show <code>app/core/parsers.py</code>: contrast the recoverable NDJSON loop with the stateful JSON-array parser.</li>
+    <li>Finish with <code>evidence/day-04-memory-comparison.md</code>: explain what the measurements prove and what they do not prove.</li>
+  </ol>
+
+  <h2>Questions your mentor may ask</h2>
+  <table>
+    <thead><tr><th>Question</th><th>Answer you should be able to give</th></tr></thead>
+    <tbody>
+      <tr><td>Why not put every rule in the Pydantic model?</td><td>Shape/type constraints and business policy change for different reasons. The service owns supported-currency policy and stays independently testable.</td></tr>
+      <tr><td>Why use <code>asyncio.to_thread</code>?</td><td>File writes and synchronous parsing are blocking work. Moving them off the event-loop thread keeps unrelated async requests responsive; it does not make the operation inherently faster.</td></tr>
+      <tr><td>Why generate the stored filename?</td><td>A client filename is untrusted input and may contain unsafe or colliding paths. The server owns storage identity and preserves only the approved suffix.</td></tr>
+      <tr><td>Why hash while copying?</td><td>The bytes are already passing through the loop, so the checksum can be computed without another whole-file read or keeping the file in memory.</td></tr>
+      <tr><td>Why can NDJSON recover after bad JSON?</td><td>Each physical line is an independent record boundary. After rejecting one line, parsing can resume at the next line.</td></tr>
+      <tr><td>Why is a JSON array harder?</td><td>Element boundaries depend on document syntax, nesting, strings, and escapes. Broken structural syntax may make the remainder untrustworthy.</td></tr>
+      <tr><td>Does “streaming” guarantee low memory?</td><td>No. The parser may yield lazily, but a consumer that builds a list retains every object. Bounded behavior is an end-to-end property.</td></tr>
+      <tr><td>Why cap failure samples but count every failure?</td><td>Operators need exact totals, but retaining every error makes memory grow with bad input. Bounded samples preserve diagnostic value without unbounded storage.</td></tr>
+      <tr><td>What is deliberately unfinished?</td><td>Field cleaning policy, per-record Pydantic and business validation, import-scope duplicates, accepted/rejected NDJSON outputs, and final count reconciliation belong to Day 5.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Your closing</h2>
+  <div class="callout">
+    <p>“The main change in my thinking is that bounded ingestion is an end-to-end design property. Uploading in chunks is not enough; parsing, consumers, summaries, and later duplicate tracking must also avoid retaining input-sized state. I now try to state each boundary and prove it with focused tests or measurements.”</p>
+  </div>
+
+  <footer>Practice without reading the prepared answers. Ask your teacher to conduct a mock mentor review and challenge each boundary.</footer>
+</main>
+</body>
+</html>

@@ -79,3 +79,8 @@ class StorageDirectoryUnavailableError(ApplicationError):
         msg = f"Storage directory unavailable: {directory}"
         super().__init__(msg, details=details or {"directory": directory})
         self.directory = directory
+
+
+class DatabaseUnavailableError(ApplicationError):
+    error_code = "database_unavailable"
+    status_code = 503

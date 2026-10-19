@@ -54,6 +54,14 @@ def test_import_batches_have_record_byte_and_item_limits() -> None:
     assert settings.import_batch_bytes == 16 * 1024 * 1024
     assert settings.maximum_record_bytes == 1024 * 1024
     assert settings.maximum_items_per_order == 1_000
+    assert settings.batch_max_attempts == 2
+
+
+def test_batch_retry_attempts_are_bounded() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, batch_max_attempts=0)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, batch_max_attempts=11)
 
 
 def test_progress_logging_is_bounded_to_100_events_per_10_million_records() -> None:

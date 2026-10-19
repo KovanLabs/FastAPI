@@ -144,7 +144,7 @@ class PolarsAdapter:
             output_created = True
 
             source_before = _source_signature(input_path)
-            records_written = _validate_canonical_ndjson(
+            records_written = validate_canonical_ndjson(
                 input_path,
                 maximum_record_bytes=self.maximum_record_bytes,
             )
@@ -222,7 +222,7 @@ class DuckDBAdapter:
             output_created = True
 
             source_before = _source_signature(input_path)
-            records_written = _validate_canonical_ndjson(
+            records_written = validate_canonical_ndjson(
                 input_path,
                 maximum_record_bytes=self.maximum_record_bytes,
             )
@@ -409,7 +409,7 @@ def _iter_canonical_records(
             yield record
 
 
-def _validate_canonical_ndjson(
+def validate_canonical_ndjson(
     path: Path,
     *,
     maximum_record_bytes: int,

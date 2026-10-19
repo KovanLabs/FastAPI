@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Add equivalent order metrics with Python and Polars</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 9 · Day 6 · Meaningful transformation</p>
+  <h1>Enrich each clean order with item metrics</h1>
+  <p class="lede">Compute the same two derived values with every selectable engine, prove semantic equivalence, and only then extend the DuckDB destination.</p>
+
+  <div class="flow">clean canonical NDJSON → selected adapter → enriched NDJSON → bounded DuckDB loader</div>
+
+  <h2>1. Define the transformation</h2>
+  <p>For every accepted order, add two top-level fields:</p>
+  <ul>
+    <li><code>item_count</code>: number of entries in <code>order.items</code>.</li>
+    <li><code>total_quantity</code>: sum of every item's <code>quantity</code>.</li>
+  </ul>
+
+  <pre><code>{
+  "record_number": 1,
+  "order": {
+    "items": [
+      {"sku": "A", "quantity": 2},
+      {"sku": "B", "quantity": 3}
+    ]
+  },
+  "item_count": 2,
+  "total_quantity": 5
+}</code></pre>
+
+  <div class="callout">
+    These are derived facts, not new business rules. Every valid order remains
+    present, its original cleaned fields remain unchanged, and source order is
+    preserved.
+  </div>
+
+  <h2>2. Change the contract test first</h2>
+  <p>Start with the deterministic two-record test in <code>tests/test_processing_adapters.py</code>. Change its expected output so both records contain the two derived fields. Keep the test parameterized over every selectable adapter.</p>
+
+  <p>Before editing production code, run only that test. The correct first result is a failure because the current adapters merely canonicalize and copy records.</p>
+
+  <pre><code>.venv/bin/python -m pytest -q \
+  tests/test_processing_adapters.py \
+  -k order_records_and_fields_deterministically</code></pre>
+
+  <h2>3. Implement the Standard Python reference</h2>
+  <p>After canonical validation, calculate:</p>
+
+  <pre><code>items = order["items"]
+item_count = len(items)
+total_quantity = sum(item["quantity"] for item in items)</code></pre>
+
+  <p>Write the enriched envelope one record at a time. Do not create a list of all orders. This implementation defines the correctness reference for the accelerated engines.</p>
+
+  <h2>4. Express the same work lazily in Polars</h2>
+  <p>Build both columns from the nested <code>order.items</code> list using Polars expressions, then select fields in the exact output order. Keep <code>scan_ndjson()</code> and <code>sink_ndjson(engine="streaming")</code>; do not call <code>collect()</code> merely to write the result.</p>
+
+  <p>Inspect the physical plan after adding the expressions. The desired shape remains a scan, streaming-compatible projection/expression work, and a sink. Measure memory instead of assuming it remains bounded.</p>
+
+  <h2>5. Preserve the three-engine contract</h2>
+  <p>The current project also exposes <code>DuckDBAdapter</code> as a selectable transformation engine. It must calculate the same fields in its SQL projection, or it must be removed deliberately from the selectable contract. It cannot silently produce a different schema.</p>
+
+  <h2>6. Extend the DuckDB loader last</h2>
+  <p>Only after adapter equivalence passes, add <code>item_count</code> and <code>total_quantity</code> columns to <code>accepted_orders</code> and include them in the parameterized insert. Keep the existing row/byte/item bounds, transaction, rollback, and idempotency behavior unchanged.</p>
+
+  <h2>7. Required proof</h2>
+  <ol>
+    <li>A two-item order produces <code>item_count=2</code> and <code>total_quantity=5</code>.</li>
+    <li>All selectable adapters produce byte-identical enriched NDJSON.</li>
+    <li>Input order and nested item order remain unchanged.</li>
+    <li>A later invalid record still removes partial adapter output.</li>
+    <li>DuckDB stores the derived columns in the same batch transaction.</li>
+    <li>Replay still inserts no duplicate rows.</li>
+    <li>Benchmarks compare hashes, elapsed time, and peak RSS on equal work.</li>
+  </ol>
+
+  <div class="warning callout">
+    Polars may execute this expression faster, but the result is not assumed in
+    advance. Correctness equivalence comes first; timing and memory measurement
+    come afterward.
+  </div>
+
+  <h2>Your first task</h2>
+  <p>Edit only the deterministic adapter test. For its first record, use two items with quantities <code>2</code> and <code>3</code>, and expect <code>item_count=2</code> and <code>total_quantity=5</code>. Run the focused command and keep the failing output.</p>
+
+  <footer>
+    <p>Primary reading: Polars <a href="https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.list.len.html"><code>list.len</code></a>, <a href="https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.list.sum.html"><code>list.sum</code></a>, <a href="https://docs.pola.rs/api/python/stable/reference/expressions/api/polars.Expr.struct.field.html"><code>struct.field</code></a>, <a href="https://docs.pola.rs/api/python/stable/reference/api/polars.scan_ndjson.html"><code>scan_ndjson</code></a>, and <a href="https://docs.pola.rs/user-guide/concepts/streaming/">streaming execution</a>. Review <a href="0006-understand-polars-lazy-scan.html">Lesson 6</a> and <a href="0008-remove-global-sort-safely.html">Lesson 8</a> if needed. Ask your agent to review your failing test before changing an adapter.</p>
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Day 4 — Bounded NDJSON parsing so far</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 2 · Day 4 · completed work so far</p>
+  <h1>Read one NDJSON record safely</h1>
+  <p class="lede">Today’s parser reads a bounded amount, classifies each line, and can continue after a bad record. This lesson explains what the code does, why its steps are ordered this way, and what remains unfinished.</p>
+
+  <h2>First, separate the four concepts</h2>
+  <table>
+    <thead><tr><th>Concept</th><th>Meaning in this project</th></tr></thead>
+    <tbody>
+      <tr><td>Upload</td><td>How the client sends a file to the API. <code>POST /imports</code> receives an <code>UploadFile</code> as form data and stores it.</td></tr>
+      <tr><td>Format</td><td>How records are arranged in the stored bytes. NDJSON uses one JSON value per line; today the parser requires each nonblank value to be an object.</td></tr>
+      <tr><td>Parser</td><td>Code that reads bytes, decodes UTF-8, parses JSON text into Python values, and checks the required object shape.</td></tr>
+      <tr><td>Batch</td><td>A group of parsed records processed together downstream. The NDJSON parser itself yields one outcome at a time.</td></tr>
+    </tbody>
+  </table>
+  <p>FastAPI’s <a href="https://fastapi.tiangolo.com/tutorial/stream-json-lines/">“Stream JSON Lines with FastAPI”</a> tutorial demonstrates an <em>outgoing</em> response: its endpoint yields items to a client. It does not parse an upload. The incoming side is handled with an <code>UploadFile</code>, as described in <a href="https://fastapi.tiangolo.com/tutorial/request-files/">FastAPI “Request Files”</a>.</p>
+
+  <h2>What one outcome represents</h2>
+  <p><code>ParseOutcome</code> is a small envelope for the result of one input line. It prevents an ordinary bad record from aborting the whole file.</p>
+  <pre>@dataclass(frozen=True)
+class ParseOutcome:
+    line_number: int
+    record: dict[str, object] | None = None
+    error_code: str | None = None
+    skipped_blank: bool = False</pre>
+  <ul>
+    <li><code>line_number</code> identifies where the outcome came from.</li>
+    <li><code>record</code> contains the parsed object on success; otherwise it is <code>None</code>.</li>
+    <li><code>error_code</code> names a failure such as <code>invalid_utf8</code>, <code>invalid_json</code>, <code>not_object</code>, or <code>record_too_large</code>.</li>
+    <li><code>skipped_blank</code> distinguishes an intentionally skipped blank from a failure.</li>
+  </ul>
+  <p>The implementation is in <a href="../app/core/parsers.py"><code>app/core/parsers.py</code></a>.</p>
+
+  <h2>The bounded-read sequence</h2>
+  <div class="flow">binary stream
+  → readline(maximum_record_bytes + 2)
+  → remove LF / optional CR
+  → enforce the raw-byte limit
+  → strict UTF-8 decode
+  → json.loads(text)
+  → require a dict
+  → yield one ParseOutcome</div>
+  <ol>
+    <li><strong>Read at most a requested size.</strong> <code>readline(size)</code> returns no more than <code>size</code> bytes. The parser asks for the configured maximum plus two bytes so a maximum-sized record followed by CRLF can be recognized. See Python IO’s <a href="https://docs.python.org/3/library/io.html#io.IOBase.readline"><code>IOBase.readline(size)</code></a> and <a href="https://docs.python.org/3/library/io.html#binary-i-o">Binary I/O</a> topics.</li>
+    <li><strong>Measure the record, not its line ending.</strong> LF and an optional preceding CR are removed before counting. Other spaces remain part of the record size.</li>
+    <li><strong>Drain an oversized line.</strong> If it exceeds the cap, the parser discards the rest in bounded chunks through the next newline. That prevents the tail of one bad record from being mistaken for a new record. FastAPI’s <a href="https://fastapi.tiangolo.com/tutorial/stream-json-lines/">“JSON Lines”</a> topic describes the newline-separated record format.</li>
+    <li><strong>Decode strictly.</strong> The raw bytes are decoded as UTF-8 only after passing the byte cap. A <code>UnicodeDecodeError</code> becomes <code>invalid_utf8</code>. Binary streams do not decode bytes automatically; see Python IO’s <a href="https://docs.python.org/3/library/io.html#binary-i-o">Binary I/O</a> and <a href="https://docs.python.org/3/library/io.html#text-i-o">Text I/O</a> topics.</li>
+    <li><strong>Parse JSON and check its shape.</strong> <code>json.loads(text)</code> can return different Python types, so valid JSON like <code>[]</code> is classified as <code>not_object</code>. Malformed JSON is classified separately as <code>invalid_json</code>. See Python JSON’s <a href="https://docs.python.org/3/library/json.html#basic-usage">Basic Usage</a> and <a href="https://docs.python.org/3/library/json.html#exceptions">Exceptions</a>.</li>
+    <li><strong>Yield instead of accumulating.</strong> Each outcome is produced as the iterator advances. The parser does not build a list containing the whole dataset; callers could still use <code>list(...)</code> and retain everything, so production consumers must iterate or use bounded batches.</li>
+  </ol>
+
+  <h2>The mixed fixture and what it proves</h2>
+  <p><a href="../tests/test_parsers.py">The focused parser tests</a> include a short valid–invalid–valid sequence and a mixed case with blank lines, CRLF at the exact size limit, invalid UTF-8, malformed JSON, a non-object JSON value, an oversized line, and a final valid line without a newline.</p>
+  <table>
+    <thead><tr><th>Input condition</th><th>Outcome</th><th>Continue?</th></tr></thead>
+    <tbody>
+      <tr><td>Empty or whitespace-only line within limit</td><td><code>skipped_blank=True</code></td><td>Yes</td></tr>
+      <tr><td>Invalid UTF-8 bytes</td><td><code>error_code="invalid_utf8"</code></td><td>Yes</td></tr>
+      <tr><td>Malformed JSON text</td><td><code>error_code="invalid_json"</code></td><td>Yes</td></tr>
+      <tr><td>Valid JSON that is not an object</td><td><code>error_code="not_object"</code></td><td>Yes</td></tr>
+      <tr><td>Record exceeds the byte cap</td><td><code>error_code="record_too_large"</code></td><td>After draining to newline</td></tr>
+      <tr><td>Valid JSON object</td><td><code>record={...}</code></td><td>Yielded to caller</td></tr>
+    </tbody>
+  </table>
+  <p>A tracking <code>BytesIO</code> records every requested <code>readline(size)</code> and asserts that none is unbounded. The tests pass with <code>pytest -q tests/test_parsers.py</code>.</p>
+
+  <div class="callout warning">
+    <strong>Policy chosen for today:</strong> the size cap takes precedence over blank-line skipping. A whitespace-only line within the cap is skipped; a whitespace-only line larger than the cap is reported as <code>record_too_large</code>. This keeps the memory bound predictable.
+  </div>
+  <p>The 1 MiB limit is a cap on raw record bytes, not a promise that the process uses only 1 MiB. UTF-8 text and the parsed Python dictionary need memory too; a batch can add more. Avoid converting the full iterator to a list when processing large files.</p>
+
+  <h2>How chunks work for a JSON array</h2>
+  <p>NDJSON can use newline as its record boundary. A JSON array cannot: a read may stop in the middle of a property name, string, number, or nested object. <code>iter_json_array(chunks)</code> receives byte chunks from its caller; it does not decide their size. For a file, the caller could repeatedly call <code>read(64 * 1024)</code>, as described by Python IO’s <a href="https://docs.python.org/3/library/io.html#io.IOBase.read"><code>IOBase.read(size)</code></a>.</p>
+  <div class="flow">file.read(64 KiB) → chunk 1 → chunk 2 → chunk 3 → …
+                                  ↓
+                    parser carries partial JSON state</div>
+  <pre>chunks = [
+    b'[{"id":',
+    b'1},',
+    b'{"id":2}]',
+]</pre>
+  <p>Those three pieces are deliberately split in the middle of the first object. A correct parser keeps enough unfinished bytes and state after chunk 1, completes <code>{"id": 1}</code> after chunk 2, then completes <code>{"id": 2}</code> after chunk 3.</p>
+  <p>The current implementation tracks nesting depth (<code>{}</code> and <code>[]</code>), whether it is inside a quoted string, and whether the previous character was an escape. That matters because a brace inside a string—such as <code>"note": "use } here"</code>—must not close an object. Its current buffer/state handling has a known chunk-boundary bug: with the example above it returns only the first object. We confirmed this with the actual iterator, so the expected two-object result is a regression test, not current behavior yet.</p>
+  <div class="callout warning"><strong>Two memory details to fix:</strong> the current scanner checks an element’s size only after the element is complete, so an unfinished oversized element can grow the buffer too far. Also, <code>feed()</code> builds a list of all objects completed in one chunk before the outer iterator yields them. The eventual implementation must enforce the byte cap while reading and avoid unnecessary per-chunk accumulation.</div>
+  <p>ijson’s <a href="https://github.com/ICRAR/ijson#high-level-interfaces">“High-level interfaces”</a> also reads from a file-like stream and iterates matching objects; it is a useful reference design for incremental parsing.</p>
+
+  <h2>Try the parser from Swagger UI</h2>
+  <p><code>POST /imports/ndjson/validate</code> is a separate incoming-upload endpoint. It stores the upload, reads the stored file in a worker thread, and consumes <code>iter_ndjson</code> one outcome at a time. The response includes valid and blank counts, counts by error code, and at most 20 failure samples; it never returns all parsed records. The existing <code>POST /imports</code> remains storage-only and keeps its queued response.</p>
+  <ol>
+    <li>Start the app with <code>uvicorn app.main:app --reload</code>.</li>
+    <li>Open <code>http://127.0.0.1:8000/docs</code> and expand <code>POST /imports/ndjson/validate</code>.</li>
+    <li>Click <strong>Try it out</strong>, choose a <code>.ndjson</code> file, then click <strong>Execute</strong>.</li>
+    <li>Check <code>valid_records</code>, <code>skipped_blank</code>, <code>failures_by_code</code>, and the capped <code>failure_samples</code>. A malformed line should not prevent later valid lines from being counted.</li>
+  </ol>
+  <p>The endpoint accepts <code>application/x-ndjson</code> and the generic <code>application/octet-stream</code> some browsers assign to unknown file extensions. It rejects an explicitly JSON-typed upload because JSON arrays need a different parser. The <a href="https://fastapi.tiangolo.com/tutorial/request-files/">FastAPI “Request Files” page, “File Parameters with UploadFile” topic</a> explains the multipart incoming-upload mechanism. By contrast, <a href="https://fastapi.tiangolo.com/tutorial/stream-json-lines/">FastAPI “Stream JSON Lines”</a> demonstrates an outgoing streaming response.</p>
+
+  <h2>Current status and next work</h2>
+  <p>Completed today: bounded NDJSON reads, record-level outcomes, recovery after bad records, a Swagger-accessible validation endpoint with bounded summary output, and focused parser/API tests added. The parser and summary unit tests can run independently; the API tests use FastAPI’s test client. The acceptance of generic <code>application/octet-stream</code> is limited to this NDJSON-specific route; uploads explicitly typed as JSON are rejected.</p>
+  <p>Continue with <a href="0003-stream-a-large-json-array.html">Lesson 3</a> for the completed top-level JSON-array parser, ijson comparison, memory measurements with and without list conversion, and the future Polars batch boundary. The <a href="https://docs.pydantic.dev/latest/concepts/type_adapter/">Pydantic TypeAdapter</a> reference is relevant when schema validation is added after JSON parsing.</p>
+
+  <h2>Recall before you move on</h2>
+  <details><summary>Why use <code>maximum_record_bytes + 2</code> for the first read?</summary><p>It allows a record exactly at the cap followed by CRLF to fit in the bounded read.</p></details>
+  <details><summary>Why drain an oversized line through its newline?</summary><p>The rest of that line belongs to the same record. Consuming it preserves the boundary before parsing the next record.</p></details>
+  <details><summary>Why is a valid JSON array classified as <code>not_object</code>?</summary><p>JSON syntax validity and the application's required record shape are separate checks.</p></details>
+
+  <footer>
+    <p>Primary reading: Python IO — <a href="https://docs.python.org/3/library/io.html#io.IOBase.readline"><code>readline(size)</code></a>. See also the <a href="0001-trace-an-order-validation-request.html">request-flow lesson</a> and <a href="../reference/fastapi-app-line-by-line.html">application reference</a>. Ask your agent about any line or remaining design choice.</p>
+  </footer>
+</main>
+</body>
+</html>

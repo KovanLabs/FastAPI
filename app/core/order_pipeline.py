@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -18,11 +19,12 @@ from pydantic import TypeAdapter, ValidationError
 
 from app.core.order_cleaning import CleaningIssue, clean_order
 from app.core.parsers import InvalidJsonError
+from app.core.progress_logging import ProgressEventGate
 from app.schemas.orders import OrderCreate
 
 
 T = TypeVar("T")
-
+logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ValidationIssue:
@@ -108,8 +110,10 @@ def process_order_file(
     supported_currencies: Iterable[str],
     maximum_failure_samples: int = 20,
     commit_interval: int = 5_000,
+    progress_log_interval: int = 100_000,
+    maximum_record_bytes: int = 1024 * 1024,
 ) -> OrderImportSummary:
-    """Validate a JSON order array and publish two NDJSON files with rollback.
+    """Validate JSON orders and publish two NDJSON files with rollback.
 
     Pass one incrementally parses, cleans, validates, and records decisions in a
     temporary SQLite database. The winners table is updated only by valid
@@ -121,6 +125,10 @@ def process_order_file(
         raise ValueError("maximum_failure_samples must not be negative")
     if commit_interval <= 0:
         raise ValueError("commit_interval must be positive")
+    if progress_log_interval < 100_000:
+        raise ValueError("progress_log_interval must be at least 100000")
+    if maximum_record_bytes <= 0:
+        raise ValueError("maximum_record_bytes must be positive")
     if accepted_path == rejected_path:
         raise ValueError("accepted_path and rejected_path must be different")
 
@@ -140,12 +148,34 @@ def process_order_file(
     try:
         with sqlite3.connect(database_path) as connection:
             _create_import_tables(connection)
-            total_records = _stage_order_records(
-                connection,
-                input_path,
-                adapter=adapter,
-                supported_currencies=supported,
-                commit_interval=commit_interval,
+            logger.info(
+                "Streaming order parsing started",
+                extra={"event": "parsing.started"},
+            )
+            try:
+                total_records = _stage_order_records(
+                    connection,
+                    _iter_source_orders(
+                        input_path,
+                        maximum_record_bytes=maximum_record_bytes,
+                    ),
+                    adapter=adapter,
+                    supported_currencies=supported,
+                    commit_interval=commit_interval,
+                    progress_log_interval=progress_log_interval,
+                )
+            except Exception:
+                logger.exception(
+                    "Streaming order parsing failed",
+                    extra={"event": "parsing.failed"},
+                )
+                raise
+            logger.info(
+                "Streaming order parsing completed",
+                extra={
+                    "event": "parsing.completed",
+                    "records_processed": total_records,
+                },
             )
             sqlite_working_store_bytes = _sqlite_size_bytes(connection)
             (
@@ -158,6 +188,15 @@ def process_order_file(
                 accepted_path=accepted_path,
                 rejected_path=rejected_path,
                 maximum_failure_samples=maximum_failure_samples,
+            )
+            logger.info(
+                "Order validation completed",
+                extra={
+                    "event": "validation.completed",
+                    "total_records": total_records,
+                    "accepted_records": accepted_records,
+                    "rejected_records": rejected_records,
+                },
             )
     finally:
         database_path.unlink(missing_ok=True)
@@ -192,72 +231,91 @@ def _create_import_tables(connection: sqlite3.Connection) -> None:
 
 def _stage_order_records(
     connection: sqlite3.Connection,
-    input_path: Path,
+    records: Iterable[object],
     *,
     adapter: TypeAdapter[OrderCreate],
     supported_currencies: frozenset[str],
     commit_interval: int,
+    progress_log_interval: int,
 ) -> int:
     total_records = 0
-    with input_path.open("rb") as source:
-        for record_number, raw in enumerate(iter_ijson_array(source), start=1):
-            total_records = record_number
-            order_id: str | None = None
-            accepted_json: str | None = None
-            rejected_json: str | None = None
+    progress_events = ProgressEventGate(progress_log_interval)
+    for record_number, raw in enumerate(records, start=1):
+        total_records = record_number
+        order_id: str | None = None
+        accepted_json: str | None = None
+        rejected_json: str | None = None
 
-            if not isinstance(raw, dict):
-                rejected_json = _rejection_json(record_number, "not_object", ())
+        if not isinstance(raw, dict):
+            rejected_json = _rejection_json(record_number, "not_object", ())
+        else:
+            cleaning = clean_order(raw)
+            if cleaning.issues:
+                rejected_json = _rejection_json(
+                    record_number,
+                    "cleaning_failed",
+                    cleaning.issues,
+                )
             else:
-                cleaning = clean_order(raw)
-                if cleaning.issues:
-                    rejected_json = _rejection_json(
-                        record_number,
-                        "cleaning_failed",
-                        cleaning.issues,
-                    )
+                try:
+                    order = adapter.validate_python(cleaning.value)
+                except ValidationError as exc:
+                    rejected_json = _schema_rejection_json(record_number, exc)
                 else:
-                    try:
-                        order = adapter.validate_python(cleaning.value)
-                    except ValidationError as exc:
-                        rejected_json = _schema_rejection_json(record_number, exc)
+                    business_issues = _business_issues(
+                        order,
+                        supported_currencies,
+                    )
+                    if business_issues:
+                        rejected_json = _rejection_json(
+                        record_number,
+                            "unsupported_currency",
+                            business_issues,
+                    )
                     else:
-                        business_issues = _business_issues(
-                            order,
-                            supported_currencies,
-                        )
-                        if business_issues:
-                            rejected_json = _rejection_json(
-                                record_number,
-                                "unsupported_currency",
-                                business_issues,
-                            )
-                        else:
-                            order_id = order.order_id
-                            accepted_json = _accepted_json(record_number, order)
+                        order_id = order.order_id
+                        accepted_json = _accepted_json(record_number, order)
 
+        connection.execute(
+            """
+            INSERT INTO records(
+                record_number, order_id, accepted_json, rejected_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (record_number, order_id, accepted_json, rejected_json),
+        )
+        if order_id is not None:
             connection.execute(
                 """
-                INSERT INTO records(
-                    record_number, order_id, accepted_json, rejected_json
-                ) VALUES (?, ?, ?, ?)
+                INSERT INTO winners(order_id, record_number)
+                VALUES (?, ?)
+                ON CONFLICT(order_id) DO UPDATE
+                SET record_number = excluded.record_number
                 """,
-                (record_number, order_id, accepted_json, rejected_json),
+                (order_id, record_number),
             )
-            if order_id is not None:
-                connection.execute(
-                    """
-                    INSERT INTO winners(order_id, record_number)
-                    VALUES (?, ?)
-                    ON CONFLICT(order_id) DO UPDATE
-                    SET record_number = excluded.record_number
-                    """,
-                    (order_id, record_number),
-                )
-            if record_number % commit_interval == 0:
-                connection.commit()
+        if record_number % commit_interval == 0:
+            connection.commit()
+        if progress_events.crossed(record_number):
+            logger.info(
+                "Streaming order parsing progress",
+                extra={
+                    "event": "parsing.progress",
+                    "records_processed": record_number,
+                },
+            )
     connection.commit()
     return total_records
+
+
+def _iter_source_orders(
+    input_path: Path,
+    *,
+    maximum_record_bytes: int,
+) -> Iterator[object]:
+    del maximum_record_bytes
+    with input_path.open("rb") as source:
+        yield from iter_ijson_array(source)
 
 
 def _publish_order_outputs(

@@ -12,6 +12,7 @@ from pathlib import Path
 import duckdb
 
 from app.core.log_context import bind_log_context
+from app.core.progress_logging import ProgressEventGate
 
 
 logger = logging.getLogger(__name__)
@@ -27,9 +28,18 @@ class BatchLoadResult:
 
 
 class BatchLoadError(RuntimeError):
-    """Raised when a canonical batch cannot be loaded atomcally."""
+    """Raised when a canonical batch cannot be loaded atomically."""
 
     retryable = False
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        batch_number: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.batch_number = batch_number
 
 
 class PermanentBatchLoadError(BatchLoadError):
@@ -68,6 +78,7 @@ class DuckDBBatchLoader:
         maximum_record_bytes: int = 1024 * 1024,
         maximum_items_per_order: int = 1_000,
         progress_log_interval: int = 100_000,
+        maximum_attempts: int = 2,
         memory_limit: str = "512MB",
         threads: int = 2,
     ) -> None:
@@ -83,6 +94,8 @@ class DuckDBBatchLoader:
             raise ValueError(
                 "progress_log_interval must be at least 100000"
             )
+        if maximum_attempts <= 0:
+            raise ValueError("maximum_attempts must be positive")
         if threads <= 0:
             raise ValueError("threads must be positive")
         self.database_path = database_path
@@ -91,6 +104,7 @@ class DuckDBBatchLoader:
         self.maximum_record_bytes = maximum_record_bytes
         self.maximum_items_per_order = maximum_items_per_order
         self.progress_log_interval = progress_log_interval
+        self.maximum_attempts = maximum_attempts
         self.memory_limit = memory_limit
         self.threads = threads
 
@@ -106,6 +120,41 @@ class DuckDBBatchLoader:
         if attempt <= 0:
             raise ValueError("attempt must be positive")
 
+        final_attempt = attempt + self.maximum_attempts - 1
+        for current_attempt in range(attempt, final_attempt + 1):
+            try:
+                return self._load_attempt(
+                    input_path,
+                    import_id=import_id,
+                    attempt=current_attempt,
+                )
+            except RetryableBatchLoadError as exc:
+                if current_attempt == final_attempt:
+                    raise
+                with bind_log_context(
+                    import_id=import_id,
+                    engine="duckdb",
+                    batch_number=exc.batch_number,
+                    attempt=current_attempt,
+                ):
+                    logger.warning(
+                        "Batch retry scheduled",
+                        extra={
+                            "event": "batch.retry_scheduled",
+                            "next_attempt": current_attempt + 1,
+                            "retryable": True,
+                        },
+                    )
+
+        raise AssertionError("batch retry loop did not return or raise")
+
+    def _load_attempt(
+        self,
+        input_path: Path,
+        *,
+        import_id: str,
+        attempt: int,
+    ) -> BatchLoadResult:
         with bind_log_context(
             import_id=import_id,
             engine="duckdb",
@@ -118,12 +167,16 @@ class DuckDBBatchLoader:
             try:
                 result = self._load(input_path, import_id=import_id)
             except Exception as exc:
+                failure_fields: dict[str, object] = {
+                    "event": "batch.loading_failed",
+                    "retryable": getattr(exc, "retryable", False),
+                }
+                failed_batch_number = getattr(exc, "batch_number", None)
+                if failed_batch_number is not None:
+                    failure_fields["batch_number"] = failed_batch_number
                 logger.exception(
                     "Batch loading failed",
-                    extra={
-                        "event": "batch.loading_failed",
-                        "retryable": getattr(exc, "retryable", False),
-                    },
+                    extra=failure_fields,
                 )
                 raise
             logger.info(
@@ -147,7 +200,8 @@ class DuckDBBatchLoader:
         batches_skipped = 0
         input_digest = hashlib.sha256()
         total_batches = 0
-        next_progress_at = self.progress_log_interval
+        active_batch_number: int | None = None
+        progress_events = ProgressEventGate(self.progress_log_interval)
 
         try:
             with duckdb.connect(str(self.database_path)) as connection:
@@ -197,6 +251,7 @@ class DuckDBBatchLoader:
                     for line in batch:
                         input_digest.update(line.encode("utf-8"))
                     with bind_log_context(batch_number=batch_number):
+                        active_batch_number = batch_number
                         try:
                             committed = self._load_one_batch(
                                 connection,
@@ -216,7 +271,7 @@ class DuckDBBatchLoader:
                             batches_committed += 1
                         else:
                             batches_skipped += 1
-                        if records_seen >= next_progress_at:
+                        if progress_events.crossed(records_seen):
                             logger.info(
                                 "Batch loading progress",
                                 extra={
@@ -224,9 +279,7 @@ class DuckDBBatchLoader:
                                     "records_processed": records_seen,
                                 },
                             )
-                            next_progress_at = (
-                                records_seen // self.progress_log_interval + 1
-                            ) * self.progress_log_interval
+                    active_batch_number = None
 
                 ledger_shape = connection.execute(
                     """
@@ -274,7 +327,8 @@ class DuckDBBatchLoader:
             raise
         except _RETRYABLE_DUCKDB_EXCEPTIONS as exc:
             raise RetryableBatchLoadError(
-                "DuckDB batch loading hit a retryable infrastructure failure"
+                "DuckDB batch loading hit a retryable infrastructure failure",
+                batch_number=active_batch_number,
             ) from exc
         except Exception as exc:
             raise PermanentBatchLoadError("DuckDB batch loading failed") from exc

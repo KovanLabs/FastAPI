@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Day 6 Polars lazy scan skeleton</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 6 · Day 6 · Polars</p>
+  <h1>From an NDJSON path to a streaming result</h1>
+  <p class="lede">This experiment separates four ideas: declaring the source path, declaring its nested schema, building a lazy query plan, and executing that plan with the streaming engine.</p>
+
+  <div class="flow">accepted.ndjson → explicit schema → LazyFrame plan → collect(engine="streaming") → DataFrame</div>
+
+  <h2>Imports and input</h2>
+  <table>
+    <thead><tr><th>Code</th><th>What it does</th><th>Why it is here</th></tr></thead>
+    <tbody>
+      <tr><td><code>from pathlib import Path</code></td><td>Imports Python’s path-object type.</td><td>It avoids manual path-string joining and clearly marks the value as a filesystem path.</td></tr>
+      <tr><td><code>import polars as pl</code></td><td>Imports Polars using its conventional short name.</td><td>Every Polars type and operation can be referenced through <code>pl</code>.</td></tr>
+      <tr><td><code>INPUT_PATH = Path(...)</code></td><td>Describes the frozen Day 5 accepted NDJSON file.</td><td>The relative path resolves from the directory in which the command is run, so the command should run from the repository root.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The explicit schema</h2>
+  <table>
+    <thead><tr><th>Code</th><th>Meaning</th><th>Contract consequence</th></tr></thead>
+    <tbody>
+      <tr><td><code>def build_schema() -&gt; pl.Schema</code></td><td>Defines a function whose result is a Polars schema.</td><td>The schema is reusable by the adapter and its tests.</td></tr>
+      <tr><td><code>pl.Schema({...})</code></td><td>Maps each top-level JSON key to a Polars data type.</td><td>We do not let a small input prefix decide the contract through inference.</td></tr>
+      <tr><td><code>record_number: pl.Int64</code></td><td>Represents the source record number as a signed 64-bit integer.</td><td>It can be used as the deterministic sort key.</td></tr>
+      <tr><td><code>order: pl.Struct({...})</code></td><td>Models the nested JSON <code>order</code> object.</td><td>Nested fields remain grouped under <code>order</code> instead of being flattened accidentally.</td></tr>
+      <tr><td><code>pl.String</code></td><td>Keeps canonical text fields as strings.</td><td>In particular, amount and timestamp serialization are not reinterpreted by this experiment.</td></tr>
+      <tr><td><code>items: pl.List(pl.Struct(...))</code></td><td>Models <code>items</code> as an ordered array of nested objects.</td><td>The schema retains the list/struct shape produced by Day 5.</td></tr>
+      <tr><td><code>quantity: pl.Int64</code></td><td>Models the canonical quantity as an integer.</td><td>A schema mismatch is visible instead of intentionally ignored.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Build and execute the lazy plan</h2>
+  <table>
+    <thead><tr><th>Code</th><th>When it acts</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td><code>def main() -&gt; None</code></td><td>When <code>main()</code> is called.</td><td>Groups the experiment without returning a value.</td></tr>
+      <tr><td><code>pl.scan_ndjson(...)</code></td><td>Builds a lazy source node; it does not execute the complete query.</td><td>The query optimizer can later push projections and predicates toward the scan.</td></tr>
+      <tr><td><code>schema=build_schema()</code></td><td>During scan-plan construction.</td><td>The expected nested types are deliberate rather than inferred.</td></tr>
+      <tr><td><code>ignore_errors=False</code></td><td>During parsing when the plan executes.</td><td>A schema parsing failure remains visible; Polars does not replace it with <code>Null</code> under the ignore-errors option.</td></tr>
+      <tr><td><code>collect_schema()</code></td><td>Resolves the schema of the lazy result.</td><td>It checks the planned column types, not the transformed data values or Day 5 business rules.</td></tr>
+      <tr><td><code>explain()</code></td><td>Formats the optimized logical query plan.</td><td>It shows what Polars plans to do, but it is not the streaming physical-plan evidence required at the milestone exit.</td></tr>
+      <tr><td><code>collect(engine="streaming")</code></td><td>Executes the query.</td><td>It asks Polars to use streaming execution and returns a materialized <code>DataFrame</code>. Unsupported operators may still fall back.</td></tr>
+      <tr><td><code>print(result)</code></td><td>After execution completes.</td><td>Lets us inspect the one canonical golden record during this small experiment.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The direct-execution guard</h2>
+  <p><code>if __name__ == "__main__":</code> is true when Python executes this file directly. It is false when another module imports the file. Therefore, <code>main()</code> runs for the terminal experiment without running automatically during an import.</p>
+
+  <h2>What this experiment does not prove</h2>
+  <ul>
+    <li>It does not prove byte-for-byte equivalence; the adapter and shared serializer tests do that.</li>
+    <li>It does not prove every operation streamed; inspect the physical graph.</li>
+    <li>It does not prove bounded peak memory; measure process memory with a larger fixture.</li>
+    <li>It does not validate cleaning or business rules; Day 5 owns those stages.</li>
+  </ul>
+
+  <h2>Retrieval check</h2>
+  <details><summary>Which line actually executes the query?</summary><p><code>collect(engine="streaming")</code>.</p></details>
+  <details><summary>Why retain amount as a string?</summary><p>The external canonical contract is <code>"2.35"</code>; this experiment must not silently change its representation.</p></details>
+  <details><summary>Does requesting streaming prove every operator streamed?</summary><p>No. Polars documents that unsupported operations can fall back to in-memory execution, so the physical plan and process memory must be inspected.</p></details>
+
+  <footer>
+    <p>Primary reading: Polars <a href="https://docs.pola.rs/api/python/stable/reference/api/polars.scan_ndjson.html"><code>scan_ndjson</code></a>, especially schema and <code>ignore_errors</code>; and the Polars guide <a href="https://docs.pola.rs/user-guide/concepts/streaming/">Streaming</a>, especially “Inspecting a streaming query.” Ask your agent about any line that remains unclear.</p>
+  </footer>
+</main>
+</body>
+</html>

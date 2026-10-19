@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Large JSON parsing cheat sheet</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Reference · Day 4</p>
+  <h1>Large JSON parsing cheat sheet</h1>
+  <table>
+    <thead><tr><th>Need</th><th>Use</th><th>Avoid</th></tr></thead>
+    <tbody>
+      <tr><td>Incoming file</td><td><code>UploadFile</code>, bounded storage chunks</td><td>Reading the entire request into one <code>bytes</code></td></tr>
+      <tr><td>NDJSON</td><td><code>iter_ndjson</code>, newline recovery</td><td>Treating it as one JSON array</td></tr>
+      <tr><td>Standard JSON array</td><td><code>iter_file_chunks</code> → <code>iter_json_array</code></td><td>Assuming a chunk equals a record</td></tr>
+      <tr><td>Mature array iteration</td><td><code>ijson.items(file, "item")</code></td><td><code>json.load</code> for multi-gigabyte files</td></tr>
+      <tr><td>Keep memory bounded</td><td>Process each record or a bounded batch</td><td><code>list(iterator)</code></td></tr>
+      <tr><td>Polars cleaning</td><td>Create bounded DataFrames after validation</td><td>Building one DataFrame from all Python dictionaries</td></tr>
+    </tbody>
+  </table>
+
+  <h2>JSON-array state</h2>
+  <div class="flow">before_array → first_or_end → in_element → separator_or_end
+                           ↑                       │
+                           └──── element_required ←┘
+  separator_or_end → done</div>
+
+  <h2>Failure policy</h2>
+  <ul>
+    <li>Valid object: process and continue.</li>
+    <li>Valid non-object: report <code>not_object</code> and continue.</li>
+    <li>Element exceeds raw-byte cap: reject with <code>record_too_large</code>.</li>
+    <li>Broken JSON structure/UTF-8: reject the JSON document; boundaries are no longer trustworthy.</li>
+  </ul>
+
+  <h2>Commands</h2>
+  <pre>.venv/bin/python -m pytest -q tests/test_parsers.py
+.venv/bin/python -m scripts.compare_json_memory /tmp/orders_100k.json --strategy custom
+.venv/bin/python -m scripts.compare_json_memory /tmp/orders_100k.json --strategy ijson
+.venv/bin/python -m scripts.compare_json_memory /tmp/orders_100k.json --strategy custom --materialize</pre>
+
+  <footer>
+    <p>Sources: Python <a href="https://docs.python.org/3/library/io.html#io.IOBase.read"><code>read(size)</code></a>, Python JSON <a href="https://docs.python.org/3/library/json.html#basic-usage">“Basic Usage”</a>, and ijson <a href="https://github.com/ICRAR/ijson#high-level-interfaces">“High-level interfaces”</a>. Full teaching walkthrough: <a href="../lessons/0003-stream-a-large-json-array.html">Lesson 3</a>.</p>
+  </footer>
+</main>
+</body>
+</html>

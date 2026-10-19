@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Explain the FastAPI large-data project to the CEO</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 10 · CEO briefing · 2-hour preparation</p>
+  <h1>Explain the project as an engineering decision story</h1>
+  <p class="lede">Your goal is not to list files or FastAPI features. Your goal is to show that you understand the business problem, the failure modes of large imports, the chosen boundaries, the measured evidence, and the remaining production gap.</p>
+
+  <div class="callout">
+    <strong>Open with this:</strong> “I built a FastAPI vendor-order import service that accepts large JSON or NDJSON files, keeps memory usage controlled by processing incrementally, produces auditable accepted and rejected records, supports interchangeable processing engines, and loads valid results into DuckDB in bounded, idempotent transactions.”
+  </div>
+
+  <h2>1. The problem we are solving</h2>
+  <p>Vendors send order files that may be large, dirty, duplicated, malformed, or interrupted during upload. A simple endpoint using <code>await file.read()</code> and <code>json.load()</code> can make memory grow with the complete file, block useful work until parsing finishes, and provide poor recovery or audit information.</p>
+  <p>The design therefore optimizes for five properties:</p>
+  <ol>
+    <li><strong>Bounded resource use:</strong> limit upload chunks, records, batches, nested items, database memory, and threads.</li>
+    <li><strong>Deterministic correctness:</strong> the same input and policy produce the same accepted, rejected, and processed output.</li>
+    <li><strong>Auditability:</strong> retain checksums, source record numbers, stable error codes, reconciled counts, and import states.</li>
+    <li><strong>Failure safety:</strong> temporary files, atomic replacement, database rollback, compensation, and replay checks prevent partial success from appearing complete.</li>
+    <li><strong>Replaceable performance:</strong> correctness is defined once; Python, Polars, or DuckDB can implement the clean transformation stage.</li>
+  </ol>
+
+  <h2>2. The end-to-end flow</h2>
+  <div class="flow">HTTP multipart upload
+    ↓  read fixed-size chunks; enforce total-byte limit; SHA-256 while copying
+staged file with generated name
+    ↓  return 202 Accepted and queue background work
+import state: uploaded → queued → processing
+    ↓
+JSON array: incremental parse → clean → schema validate → business validate
+    ↓                          ↘ rejected.ndjson + stable reasons
+temporary SQLite spool → last-valid-wins duplicate decision
+    ↓
+accepted.ndjson (canonical contract)
+    ↓
+Python | Polars | DuckDB adapter → add item_count + total_quantity
+    ↓
+processed.ndjson
+    ↓
+row- and byte-bounded DuckDB transactions + idempotency ledger
+    ↓
+summary.json + completed / completed_with_errors / failed</div>
+
+  <h3>What FastAPI owns</h3>
+  <ul>
+    <li>HTTP routes, multipart <code>UploadFile</code>, dependency injection, response models, generated OpenAPI documentation, middleware, exception translation, and background-task scheduling.</li>
+    <li>The upload route is <code>async</code> because it awaits incoming chunks. Blocking file writes are moved with <code>asyncio.to_thread</code> so they do not occupy the event-loop thread.</li>
+    <li>CPU-heavy parsing and database work execute after the <code>202</code> response. In this learning implementation that uses FastAPI <code>BackgroundTasks</code>; it is deliberately not claimed as a durable production queue.</li>
+  </ul>
+
+  <h3>What the domain/core layers own</h3>
+  <ul>
+    <li>Pydantic models define the HTTP and order contracts; the cleaning layer defines normalization policy; business validation defines supported currencies.</li>
+    <li>The parser, duplicate index, processing adapters, loader, and coordinator are plain Python components. This keeps business and data logic testable without starting an HTTP server.</li>
+    <li>Dependency injection supplies settings, services, the job repository, and writer lock. This makes dependencies explicit and replaceable in tests or a future deployment.</li>
+  </ul>
+
+  <h2>3. Why each major choice was made</h2>
+  <table>
+    <thead><tr><th>Choice</th><th>Why</th><th>Trade-off / boundary</th></tr></thead>
+    <tbody>
+      <tr><td><code>UploadFile</code> + chunks</td><td>Avoid creating one application-level byte object for the complete upload; enforce a real byte limit while hashing and storing.</td><td>The framework may spool multipart data; the application still controls its own reads and final storage.</td></tr>
+      <tr><td>Stage before processing</td><td>Separates an unreliable HTTP connection from deterministic processing and gives an immutable file plus checksum.</td><td>Needs storage capacity and lifecycle cleanup.</td></tr>
+      <tr><td><code>202 Accepted</code></td><td>Large processing should not keep the client connection open. Clients poll state, summary, and errors.</td><td><code>202</code> means scheduled, not completed or durable.</td></tr>
+      <tr><td>Incremental JSON / NDJSON</td><td>Process one record at a time instead of materializing the top-level array.</td><td>Streaming parsers are more complex; consumers must not call <code>list(...)</code>.</td></tr>
+      <tr><td>Explicit record limits</td><td>A single pathological line/object can otherwise defeat whole-file streaming.</td><td>Oversized records are rejected even if the total file is acceptable.</td></tr>
+      <tr><td>Pydantic + separate cleaning</td><td>Cleaning policy is explicit and idempotent; schema errors are structured; business rules remain distinguishable from format errors.</td><td>More stages than placing every rule in a model validator, but clearer ownership and error reporting.</td></tr>
+      <tr><td>Temporary SQLite spool</td><td>“Last valid duplicate wins” requires import-wide state. Disk-backed state prevents millions of IDs from consuming the Python heap.</td><td>Two-pass I/O and local disk cost are accepted for bounded memory and deterministic ordering.</td></tr>
+      <tr><td>Canonical NDJSON seam</td><td>Downstream engines receive already-clean, record-oriented data. Parsing and business policy are not reimplemented three times.</td><td>Creates an intermediate artifact, which costs disk I/O but improves isolation, replay, and auditability.</td></tr>
+      <tr><td>Python default</td><td>It is the simplest correctness reference and had the lowest measured peak RSS in the current transformation benchmark.</td><td>It was slower than Polars and DuckDB on 100,000 records.</td></tr>
+      <tr><td>Polars / DuckDB adapters</td><td>Allow vectorized or SQL execution without changing the public flow; equivalence is proven by byte-identical golden output.</td><td>Acceleration can increase memory. Engine choice must follow measurements and workload.</td></tr>
+      <tr><td>Bounded DuckDB batches</td><td>Cap rows and bytes per transaction, rollback failed batches, and make replay detectable through checksums and ledgers.</td><td>Embedded DuckDB is a good local analytical store, not a horizontally scalable multi-writer service.</td></tr>
+      <tr><td>State machine</td><td>Prevents impossible transitions and distinguishes record rejection from job failure.</td><td>The current repository is in memory, so process restart loses API-visible job state.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>4. What has been completed so far</h2>
+  <ol>
+    <li><strong>API foundation:</strong> typed order contracts, nested validation, business validation, response filtering, consistent application errors, health endpoints, request IDs, and process-time headers.</li>
+    <li><strong>Architecture boundaries:</strong> routes, dependencies, services, configuration, exceptions, schemas, and core processing are separated and independently testable.</li>
+    <li><strong>Safe upload:</strong> multipart JSON/NDJSON, content-type checks, chunked reads, total-size enforcement, SHA-256, generated filenames, temporary-file cleanup, and atomic final rename.</li>
+    <li><strong>Large-file parsing:</strong> bounded NDJSON lines and incremental top-level JSON arrays, including malformed data and per-record size handling.</li>
+    <li><strong>Order pipeline:</strong> deterministic normalization, exact decimal policy, timezone normalization, nested validation, stable error mapping, import-wide duplicate policy, accepted/rejected artifacts, and reconciled summary.</li>
+    <li><strong>Engine abstraction:</strong> equivalent Standard Python, Polars, and DuckDB adapters derive <code>item_count</code> and <code>total_quantity</code> under a shared contract.</li>
+    <li><strong>Persistence and orchestration:</strong> bounded DuckDB transactions, idempotent batch replay, compensating cleanup, job-state endpoints, summaries, and bounded error retrieval.</li>
+  </ol>
+
+  <h2>5. Measured evidence—say the scope every time</h2>
+  <table>
+    <thead><tr><th>Evidence</th><th>Result</th><th>What it proves</th></tr></thead>
+    <tbody>
+      <tr><td>Upload read experiment</td><td>64 MiB whole read: 64 MiB Python peak; 1 MiB chunks: about 2 MiB.</td><td>Application read allocations remain tied to chunk size rather than file size.</td></tr>
+      <tr><td>JSON-array comparison</td><td>100k records: <code>json.load</code> 162.37 MiB RSS; incremental parsers about 18.3 MiB when not materialized.</td><td>Incremental consumption—not merely using an iterator—is the memory advantage.</td></tr>
+      <tr><td>Large fixture</td><td>10 million records counted with <code>ijson</code> in 44.734 s at 18.51 MiB peak RSS on the development machine.</td><td>The parser can traverse a multi-gigabyte-style workload without retaining all records.</td></tr>
+      <tr><td>Duplicate state</td><td>100k Python IDs peaked at ~11.4 MB; projected 10m IDs ~1.14 GB of Python heap.</td><td>Why duplicate tracking moved to temporary SQLite instead of a Python set.</td></tr>
+      <tr><td>Adapter benchmark</td><td>100k: Python 10.597 s / 77.65 MiB; Polars 6.137 s / 238.62 MiB; DuckDB 5.989 s / 171.48 MiB.</td><td>Speed and memory are separate axes; “faster library” does not automatically mean “less memory.”</td></tr>
+      <tr><td>Correctness</td><td>All three engine outputs had the same SHA-256 and byte count.</td><td>Acceleration preserved the declared transformation for this fixture.</td></tr>
+      <tr><td>Tests</td><td>Repository evidence records 236 tests passing in 16.29 s outside the restricted sandbox.</td><td>Broad automated coverage; describe this as a recorded run, not a fresh production certification.</td></tr>
+    </tbody>
+  </table>
+  <p class="warning callout"><strong>Do not say “constant memory.”</strong> Say “bounded by configured chunks, record limits, batches, and engine behavior for the tested operations.” Libraries, buffers, the runtime, and more complex queries still consume memory.</p>
+
+  <h2>6. The honest production-readiness answer</h2>
+  <p>Say this directly: “The data-path design is production-oriented, but the orchestration is currently a single-process reference implementation.” Then name the boundaries:</p>
+  <ul>
+    <li>Job state is in memory and disappears on restart.</li>
+    <li>FastAPI <code>BackgroundTasks</code> is not a durable queue and does not retry after process failure.</li>
+    <li>Uploads, artifacts, and the DuckDB database are on local storage.</li>
+    <li>The database-writer lock is process-local; multiple API workers do not share it.</li>
+    <li>The default API upload limit is 100 MiB; the 10-million-record fixture tested the parser path, not the default HTTP endpoint.</li>
+    <li>Current telemetry settings exist, but full production tracing/metrics/export and alerting are not yet integrated.</li>
+  </ul>
+  <p>The production evolution is: durable object storage → durable job table plus outbox → message queue → leased worker with heartbeat/retries → manifest-based artifact publication → scalable serving database if concurrent writes are required.</p>
+
+  <h2>7. Your 7-minute spoken explanation</h2>
+  <ol>
+    <li><strong>0:00–0:45 — Business problem:</strong> large vendor order files, bad records, duplicates, resource risk, need for auditability.</li>
+    <li><strong>0:45–1:30 — Outcome:</strong> upload, validate, normalize, split accepted/rejected, enrich, persist, expose progress.</li>
+    <li><strong>1:30–3:15 — Architecture:</strong> walk the end-to-end flow once. Focus on boundaries, not filenames.</li>
+    <li><strong>3:15–4:30 — Large-data strategy:</strong> chunks, incremental parsing, record/batch limits, disk-backed duplicate index.</li>
+    <li><strong>4:30–5:30 — Correctness and recovery:</strong> stable contracts, state machine, atomic publication, transactions, idempotency.</li>
+    <li><strong>5:30–6:15 — Evidence:</strong> use the 10m parse and 100k adapter numbers, with scope.</li>
+    <li><strong>6:15–7:00 — Status and next step:</strong> what is complete, current non-production boundaries, durable-worker roadmap.</li>
+  </ol>
+
+  <h2>8. Likely CEO questions and strong answers</h2>
+  <h3>“Why FastAPI?”</h3>
+  <p>“It gives us typed request/response contracts through Pydantic, dependency injection, async request handling, OpenAPI documentation, and low ceremony around a modular Python data stack. FastAPI is the API boundary; efficient large-data handling comes from our streaming, batching, storage, and worker design—not from the framework name alone.”</p>
+
+  <h3>“Can it handle a 2 GB or 10-million-row file?”</h3>
+  <p>“The parser path has processed 10 million records at 18.51 MiB peak RSS on this development machine. That validates incremental parsing. The current HTTP endpoint intentionally defaults to a 100 MiB upload cap, so a 2 GB production claim requires setting an explicit capacity target and load-testing the full path: proxy, multipart handling, disk, parser, engine, database, concurrency, and recovery.”</p>
+
+  <h3>“Why not just use Polars everywhere?”</h3>
+  <p>“Raw-data recovery and business rejection need record-level control. We first create a canonical clean NDJSON boundary, then use Polars or DuckDB for transformations. In our 100k benchmark Polars was faster than Python but used about 3.1 times the peak RSS, so the engine remains configurable and Python is the conservative default.”</p>
+
+  <h3>“Why SQLite and DuckDB together?”</h3>
+  <p>“They solve different problems. Temporary SQLite is a disk-backed correctness structure for import-wide duplicate decisions and ordered spooling. DuckDB is the persistent analytical destination and batch-loading engine. The temporary SQLite file is deleted after outputs are published.”</p>
+
+  <h3>“How do retries avoid duplicates?”</h3>
+  <p>“Each batch has an import ID, batch number, checksum, and record count stored atomically with its rows. An identical replay is skipped; the same key with different content fails closed. A completed-import manifest also catches modified, truncated, or extended replays.”</p>
+
+  <h3>“What happens when one record is bad?”</h3>
+  <p>“A record-level validation failure is written to <code>rejected.ndjson</code> with a stable code and field location; valid records continue. The job ends <code>completed_with_errors</code>. A parser, engine, persistence, or publication failure is a job failure and triggers cleanup/rollback.”</p>
+
+  <h3>“What would you build next?”</h3>
+  <p>“First define the production SLO and largest supported file. Then replace process-local orchestration with durable object storage, job state, outbox/queue, and leased workers. Add end-to-end telemetry and representative concurrency/load tests before choosing the default accelerated engine.”</p>
+
+  <h2>9. Two-hour preparation plan</h2>
+  <ol>
+    <li><strong>0–20 min:</strong> Read the opening, problem, and flow aloud twice. Draw the flow from memory.</li>
+    <li><strong>20–45 min:</strong> Learn the decision table. For each choice, say “because…” and one trade-off.</li>
+    <li><strong>45–65 min:</strong> Memorize only four numbers: 10m / 18.51 MiB; 100k Python 10.6 s / 77.7 MiB; Polars 6.1 s / 238.6 MiB; DuckDB 6.0 s / 171.5 MiB.</li>
+    <li><strong>65–85 min:</strong> Deliver the 7-minute version without reading. Record yourself; remove file-by-file narration.</li>
+    <li><strong>85–105 min:</strong> Answer the likely questions aloud. Always give the limitation before the roadmap.</li>
+    <li><strong>105–115 min:</strong> Rehearse a short demo: upload → receive ID → poll status → show summary/errors → show DuckDB/artifacts.</li>
+    <li><strong>115–120 min:</strong> Stop studying. Keep the cheat sheet open and begin with the one-sentence outcome.</li>
+  </ol>
+
+  <h2>10. Retrieval check</h2>
+  <p>Without looking above, answer these aloud:</p>
+  <ol>
+    <li>Why does streaming alone not guarantee bounded memory?</li>
+    <li>Why is the duplicate index on disk?</li>
+    <li>Where is the contract boundary between validation and acceleration?</li>
+    <li>What exactly does <code>202 Accepted</code> promise here?</li>
+    <li>Why is Python the default despite slower elapsed time?</li>
+    <li>What four production replacements are most important?</li>
+  </ol>
+  <details>
+    <summary>Check your answer</summary>
+    <ol>
+      <li>The consumer can still retain everything with <code>list(iterator)</code>; limits must exist at upload, record, batch, and downstream stages.</li>
+      <li>A measured Python set projection was about 1.14 GB for 10 million IDs; SQLite bounds Python heap and supports deterministic two-pass output.</li>
+      <li>Canonical accepted NDJSON. Raw parsing, cleaning, validation, and duplicates are upstream; adapters only validate the canonical contract and transform it.</li>
+      <li>The upload was stored, job metadata created, and in-process work scheduled. It does not promise completion, retry, or crash survival.</li>
+      <li>It is the simple correctness reference and used the lowest measured peak RSS for the current 100k transformation.</li>
+      <li>Durable object storage, durable job/outbox state, queue plus leased workers, and production telemetry/persistence.</li>
+    </ol>
+  </details>
+
+  <footer>
+    <p>Primary references: FastAPI <a href="https://fastapi.tiangolo.com/tutorial/request-files/">request files</a>, <a href="https://fastapi.tiangolo.com/tutorial/background-tasks/">background tasks</a>, <a href="https://fastapi.tiangolo.com/tutorial/dependencies/">dependencies</a>, and <a href="https://fastapi.tiangolo.com/tutorial/response-model/">response models</a>; Pydantic <a href="https://docs.pydantic.dev/latest/concepts/models/">models</a>; Polars <a href="https://docs.pola.rs/user-guide/concepts/streaming/">streaming</a>; DuckDB <a href="https://duckdb.org/docs/stable/configuration/pragmas.html#resource-management">resource management</a>. Repository evidence: <a href="../evidence/day-04-memory-comparison.md">Day 4 memory</a>, <a href="../evidence/day-05-bounded-order-pipeline.md">Day 5 pipeline</a>, <a href="../evidence/day-06-polars-adapter.md">Day 6 engines</a>, and <a href="../evidence/day06/production_replacement_design.md">production replacement design</a>. Keep <a href="../reference/ceo-fastapi-project-cheat-sheet.html">the CEO cheat sheet</a> open during rehearsal. Ask your agent to run a mock CEO Q&amp;A after your first read-through.</p>
+  </footer>
+</main>
+</body>
+</html>

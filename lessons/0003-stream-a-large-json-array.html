@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Day 4 — Stream a large JSON array</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 3 · Day 4 · standard JSON</p>
+  <h1>One large array, one order at a time</h1>
+  <p class="lede">The production input is a standard JSON array. This lesson traces every logical line in the bounded reader, state machine, summary, API route, and comparison script—and explains why each belongs there.</p>
+
+  <div class="flow">UploadFile → stored .json file → read(64 KiB) → parser state machine
+  → one Python value → object classification → bounded summary → Swagger response</div>
+
+  <h2>1. The public iterator</h2>
+  <p>Open <a href="../app/core/parsers.py"><code>app/core/parsers.py</code></a> and find <code>iter_json_array</code> and <code>iter_file_chunks</code>.</p>
+  <table>
+    <thead><tr><th>Code</th><th>How it works</th><th>Why it is here</th></tr></thead>
+    <tbody>
+      <tr><td><code>def iter_json_array(chunks, *, maximum_record_bytes)</code></td><td>Accepts any iterable producing byte chunks. The <code>*</code> makes the limit keyword-only.</td><td>The parser is independent of HTTP and files; tests can provide tiny artificial chunks.</td></tr>
+      <tr><td><code>parser = _IncrementalArrayParser(...)</code></td><td>Creates one stateful parser for the complete document.</td><td>State must survive from one chunk to the next.</td></tr>
+      <tr><td><code>for chunk in chunks</code></td><td>Pulls only the next available chunk.</td><td>No whole-file byte string is created.</td></tr>
+      <tr><td><code>for record in parser.feed(chunk): yield record</code></td><td>Feeds bytes and immediately forwards every completed element.</td><td><code>yield</code> lets the caller process and release each value.</td></tr>
+      <tr><td><code>for record in parser.finish(): yield record</code></td><td>Signals end-of-input and forwards final output.</td><td>EOF is where missing brackets or incomplete values must be detected.</td></tr>
+      <tr><td><code>def iter_file_chunks(source, *, chunk_bytes=64 * 1024)</code></td><td>Defines the binary-file adapter and its 65,536-byte default.</td><td>The parser consumes generic chunks; this function chooses the file read policy.</td></tr>
+      <tr><td><code>if chunk_bytes &lt;= 0: raise ValueError(...)</code></td><td>Rejects zero or negative reads.</td><td>A zero-sized read would never advance and could create an endless loop.</td></tr>
+      <tr><td><code>while chunk := source.read(chunk_bytes)</code></td><td>Reads at most the requested size until <code>b""</code> signals EOF.</td><td>Python IO defines <code>read(size)</code> as a bounded read; the assignment expression avoids reading twice.</td></tr>
+      <tr><td><code>yield chunk</code></td><td>Returns one byte block.</td><td>Only one transport chunk needs to be live at this layer.</td></tr>
+    </tbody>
+  </table>
+  <p>Primary source: Python IO, <a href="https://docs.python.org/3/library/io.html#io.IOBase.read"><code>IOBase.read(size)</code></a>. Generator expressions and generator iteration are lazy; see Python Expressions, <a href="https://docs.python.org/3/reference/expressions.html#generator-expressions">“Generator expressions”</a>.</p>
+
+  <h2>2. Parser state: memory carried between chunks</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th><th>Why needed</th></tr></thead>
+    <tbody>
+      <tr><td><code>self._max</code></td><td>Maximum raw bytes allowed for one array element.</td><td>One enormous order must not grow memory without a bound.</td></tr>
+      <tr><td><code>self._buffer</code></td><td>Bytes still needed to build the current element.</td><td>An order may start in one chunk and end in another.</td></tr>
+      <tr><td><code>self._state</code></td><td>One of <code>before_array</code>, <code>first_or_end</code>, <code>element_required</code>, <code>in_element</code>, <code>separator_or_end</code>, or <code>done</code>.</td><td>Explicit grammar states prevent missing, doubled, or trailing commas from being accepted.</td></tr>
+      <tr><td><code>self._position</code></td><td>Index of the next byte that has not been scanned.</td><td>Retained bytes must not be scanned and counted twice.</td></tr>
+      <tr><td><code>self._start</code></td><td>Index where the current element begins.</td><td>The exact byte slice is passed to <code>json.loads</code>.</td></tr>
+      <tr><td><code>self._structured</code></td><td>Whether the element begins with <code>{</code> or <code>[</code>.</td><td>Containers end by balanced nesting; scalars end at the array delimiter.</td></tr>
+      <tr><td><code>self._depth</code></td><td>Number of unmatched container openings inside the element.</td><td>A comma inside nested <code>items</code> is not an order separator.</td></tr>
+      <tr><td><code>self._in_string</code></td><td>Whether scanning is currently inside JSON quotes.</td><td>Braces and commas inside text are data, not structure.</td></tr>
+      <tr><td><code>self._escape</code></td><td>Whether the preceding character was <code>\</code>.</td><td>An escaped quote <code>\"</code> must not close the string, even across chunks.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>3. Every parser transition</h2>
+  <table>
+    <thead><tr><th>State/code</th><th>What happens and why</th></tr></thead>
+    <tbody>
+      <tr><td><code>feed(chunk)</code></td><td>Requires bytes, appends them to the retained buffer, then scans. Binary input avoids accidental text decoding at the transport boundary.</td></tr>
+      <tr><td><code>before_array</code></td><td>Skips JSON whitespace and requires <code>[</code>. Our contract is a top-level array, not one object or NDJSON.</td></tr>
+      <tr><td><code>first_or_end</code></td><td>Allows either the first element or <code>]</code> for an empty array. A comma here means an element is missing.</td></tr>
+      <tr><td><code>element_required</code></td><td>Entered after a comma. Unlike the first state, <code>]</code> is rejected, which catches a trailing comma.</td></tr>
+      <tr><td><code>self._start = i</code></td><td>Marks the first byte of the element so the exact raw size and JSON slice are known.</td></tr>
+      <tr><td><code>self._structured = ch in b"{["</code></td><td>Selects container-boundary tracking for objects and nested arrays.</td></tr>
+      <tr><td><code>self._check_size(1)</code></td><td>Counts the first byte immediately; a zero-byte maximum rejects any element.</td></tr>
+      <tr><td><code>separator_or_end</code></td><td>After a complete value, only whitespace, a comma, or the array’s <code>]</code> is legal.</td></tr>
+      <tr><td><code>done</code></td><td>After <code>]</code>, only whitespace is accepted. Other content is trailing garbage and invalidates the document.</td></tr>
+      <tr><td><code>not structured ... ch in b",]"</code></td><td>A top-level scalar ends at an array delimiter. It is still parsed as valid JSON and later classified as <code>not_object</code>.</td></tr>
+      <tr><td><code>_check_size(i - self._start + 1)</code></td><td>Checks the growing raw element before accepting the current byte.</td></tr>
+      <tr><td><code>if self._in_string</code></td><td>Updates escape/string state and ignores structural-looking characters until the string closes.</td></tr>
+      <tr><td><code>ch in b"{[" / ch in b"}]"</code></td><td>Increments/decrements nesting. Depth zero means the outer element container is complete.</td></tr>
+      <tr><td><code>_emit(records, end)</code></td><td>Copies only the completed element bytes, strips surrounding whitespace, checks size, and calls <code>json.loads</code>.</td></tr>
+      <tr><td><code>except (JSONDecodeError, UnicodeDecodeError)</code></td><td>Maps malformed JSON or invalid encoded bytes to the application’s stable <code>invalid_json</code> error.</td></tr>
+      <tr><td><code>del b[:removed]</code></td><td>Discards bytes that can no longer be needed. When an element is incomplete, only bytes before its start are discarded.</td></tr>
+      <tr><td><code>finish()</code></td><td>Requires that <code>[</code> was seen, no element remains incomplete, and the state reached <code>done</code>. EOF alone never closes JSON.</td></tr>
+    </tbody>
+  </table>
+  <p>Python JSON’s <a href="https://docs.python.org/3/library/json.html#basic-usage">“Basic Usage”</a> documents <code>loads</code>; <a href="https://docs.python.org/3/library/json.html#json.JSONDecodeError"><code>JSONDecodeError</code></a> represents invalid JSON syntax.</p>
+
+  <h2>4. Classification and bounded response</h2>
+  <p>Open <a href="../app/core/json_array_validation.py"><code>app/core/json_array_validation.py</code></a>.</p>
+  <table>
+    <thead><tr><th>Code</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td><code>@dataclass(frozen=True)</code></td><td>Creates an immutable internal summary value, separate from the HTTP schema.</td></tr>
+      <tr><td><code>valid_records</code></td><td>Counts array elements that are JSON objects.</td></tr>
+      <tr><td><code>failures_by_code</code></td><td>Aggregates every record-level classification without retaining every failure object.</td></tr>
+      <tr><td><code>failure_samples</code></td><td>Keeps only the first configured number for diagnosis, bounding response memory and size.</td></tr>
+      <tr><td><code>chunks = iter_file_chunks(...)</code></td><td>Connects the binary file to the parser using bounded reads.</td></tr>
+      <tr><td><code>enumerate(..., start=1)</code></td><td>Gives humans one-based record numbers without a separate counter.</td></tr>
+      <tr><td><code>isinstance(value, dict)</code></td><td>Separates JSON syntax validity from the application’s “each order is an object” rule.</td></tr>
+      <tr><td><code>continue</code></td><td>A valid non-object value such as <code>3</code> has a reliable boundary, so it can be reported and later objects can still be processed.</td></tr>
+      <tr><td><code>with path.open("rb")</code></td><td>Binary mode preserves raw-byte accounting; the context manager closes the file even on failure.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>5. Incoming FastAPI upload</h2>
+  <p>The route in <a href="../app/api/orders.py"><code>app/api/orders.py</code></a> is <code>POST /imports/json/validate</code>.</p>
+  <table>
+    <thead><tr><th>Code</th><th>Reason</th></tr></thead>
+    <tbody>
+      <tr><td><code>file: UploadFile = File(...)</code></td><td>Declares a required multipart file and makes Swagger render a file chooser.</td></tr>
+      <tr><td><code>media_type ...</code></td><td>Normalizes the declared MIME type before allowing JSON or a browser’s generic binary type.</td></tr>
+      <tr><td><code>await store_upload(...)</code></td><td>Applies the existing upload-size limit, checksum, safe filename, and atomic storage policy.</td></tr>
+      <tr><td><code>await asyncio.to_thread(...)</code></td><td>Runs synchronous disk parsing outside the event-loop thread.</td></tr>
+      <tr><td><code>JsonArrayValidationResponse(...)</code></td><td>Returns only metadata, counts, and capped samples; FastAPI publishes this shape in OpenAPI.</td></tr>
+    </tbody>
+  </table>
+  <p>FastAPI’s <a href="https://fastapi.tiangolo.com/tutorial/request-files/">“Request Files” — “File Parameters with UploadFile”</a> is the incoming-upload reference. FastAPI’s <a href="https://fastapi.tiangolo.com/tutorial/stream-json-lines/">“Stream JSON Lines with FastAPI”</a> demonstrates an <em>outgoing</em> streaming response; it does not parse this incoming standard-JSON upload.</p>
+
+  <h2>6. Why compare with ijson and <code>json.load</code>?</h2>
+  <p>The comparison script is <a href="../scripts/compare_json_memory.py"><code>scripts/compare_json_memory.py</code></a>, and the recorded results are in <a href="../evidence/day-04-memory-comparison.md">the Day 4 evidence note</a>.</p>
+  <table>
+    <thead><tr><th>Line/concept</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>json.load(source)</code></td><td>Parses the complete document and returns the full top-level list: simple, but memory grows with the dataset.</td></tr>
+      <tr><td><code>ijson.items(source, "item")</code></td><td><code>item</code> selects each element of the top-level array and yields it incrementally.</td></tr>
+      <tr><td><code>sum(1 for _ in records)</code></td><td>Consumes lazily and retains only a counter plus the current record.</td></tr>
+      <tr><td><code>len(list(records))</code></td><td>Deliberately retains every result to demonstrate how the caller can destroy the parser’s memory advantage.</td></tr>
+      <tr><td><code>perf_counter()</code></td><td>Measures elapsed wall-clock time.</td></tr>
+      <tr><td><code>resource.getrusage(...).ru_maxrss</code></td><td>Reports the process’s peak resident memory on this Linux development environment.</td></tr>
+    </tbody>
+  </table>
+  <p>On the 100,000-order fixture, streaming custom/ijson iteration used about 18 MiB peak RSS. <code>json.load</code> used about 162 MiB, while converting the iterators to lists used about 175–178 MiB. The 10-million-order fixture was counted with ijson in 44.734 seconds at 18.51 MiB peak RSS on this machine. These values are measurements, not universal guarantees.</p>
+  <p>ijson’s official <a href="https://github.com/ICRAR/ijson#high-level-interfaces">“High-level interfaces”</a> describes continuous reads and <code>items</code>; its <a href="https://github.com/ICRAR/ijson#options">“Options”</a> documents the 65,536-byte default buffer and number behavior. Python JSON documents <a href="https://docs.python.org/3/library/json.html#json.load"><code>load</code></a>.</p>
+
+  <h2>Recovery boundary</h2>
+  <div class="callout warning"><strong>Policy:</strong> a valid JSON value that is not an object is a record-level <code>not_object</code> failure, and iteration continues. Broken commas, brackets, encoding, or element syntax invalidate the single enclosing JSON document, so parsing stops. NDJSON can recover line by line because every newline supplies an independent boundary; a JSON array cannot safely invent a boundary after broken syntax.</div>
+
+  <h2>Retrieval check</h2>
+  <details><summary>Does 64 KiB mean one order per chunk?</summary><p>No. It is a read size. A chunk may contain part of one order, one order, or many orders.</p></details>
+  <details><summary>Why track <code>_in_string</code>?</summary><p>Structural characters inside quoted text must be treated as data.</p></details>
+  <details><summary>Why does <code>list(iterator)</code> raise memory use?</summary><p>It retains every yielded object instead of releasing each after processing.</p></details>
+  <details><summary>Where will Polars fit?</summary><p>After parsing and validation, bounded groups of valid objects can become Polars DataFrames for cleaning. One all-record list would defeat today’s memory design.</p></details>
+
+  <footer>
+    <p>Primary reading: ijson <a href="https://github.com/ICRAR/ijson#high-level-interfaces">“High-level interfaces”</a>. Review <a href="0002-bound-ndjson-record-reading.html">the NDJSON lesson</a> to compare recovery boundaries. Ask your agent about any individual line that remains unclear.</p>
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lesson 1 — Trace an order validation request</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 1 · 10 minutes</p>
+  <h1>Trace one request end to end</h1>
+  <p class="lede">Your goal is to explain why the same request touches <code>main.py</code>, <code>api/</code>, <code>schemas/</code>, <code>services/</code>, and <code>core/</code>.</p>
+
+  <h2>The request</h2>
+  <pre>POST /orders/validate
+Content-Type: application/json
+X-Request-ID: req-123
+
+{
+  "order_id": "ORD-7",
+  "customer_email": "buyer@example.com",
+  "amount": "1299.50",
+  "currency": "INR",
+  "ordered_at": "2026-09-22T10:30:00+05:30",
+  "status": "completed",
+  "items": [{"sku": "LAPTOP-01", "quantity": 2}]
+}</pre>
+
+  <h2>The seven hand-offs</h2>
+  <ol>
+    <li><strong>Uvicorn calls the ASGI app.</strong> <code>RequestContextMiddleware.__call__</code> sees an HTTP scope, extracts <code>X-Request-ID</code>, and starts a timer.</li>
+    <li><strong>FastAPI matches the route.</strong> The router registered <code>POST /orders/validate</code> to <code>validate_order</code>.</li>
+    <li><strong>Pydantic builds <code>OrderCreate</code>.</strong> It converts JSON strings into <code>EmailStr</code>, <code>Decimal</code>, <code>datetime</code>, and <code>OrderStatus</code>, then enforces every <code>Field</code> constraint.</li>
+    <li><strong>FastAPI resolves the service dependency.</strong> <code>get_order_validation_service</code> first receives cached <code>Settings</code>, then constructs the service with its supported currencies. FastAPI's <a href="https://fastapi.tiangolo.com/tutorial/dependencies/">dependency system</a> is designed to resolve this graph automatically.</li>
+    <li><strong>The service applies the business rule.</strong> It checks whether <code>INR</code> belongs to the configured immutable set. If so, it returns <code>OrderResponse</code>.</li>
+    <li><strong>The response model enforces the public contract.</strong> FastAPI validates, serializes, and filters the result through <code>OrderResponse</code>; <a href="https://fastapi.tiangolo.com/tutorial/response-model/">response models</a> also drive OpenAPI documentation.</li>
+    <li><strong>The middleware finishes the response.</strong> Its wrapped <code>send</code> adds <code>X-Process-Time</code> and echoes <code>X-Request-ID</code>.</li>
+  </ol>
+
+  <div class="callout">
+    <strong>Why so many files?</strong> Each layer has one reason to change. HTTP routing can evolve without moving the currency rule; the currency rule can evolve without changing how settings load; request fields can evolve without rewriting middleware.
+  </div>
+
+  <h2>Now run the failure path mentally</h2>
+  <p>Change <code>"currency": "INR"</code> to <code>"currency": "JPY"</code>.</p>
+  <div class="flow">OrderValidationService.validate
+  → raises UnsupportedCurrencyError
+  → FastAPI finds application_error_handler(ApplicationError)
+  → handler reads status_code=422, error_code, message, details
+  → handler reads request.state.request_id set by middleware
+  → JSONResponse returns the stable error envelope
+  → middleware still adds response headers</div>
+  <p>The route does not catch the exception. That is intentional: one <a href="https://fastapi.tiangolo.com/tutorial/handling-errors/">global exception handler</a> keeps every application error consistent.</p>
+
+  <h2>Retrieval check</h2>
+  <p>Answer before opening each explanation.</p>
+  <details><summary>Which layer decides whether “JPY” is supported?</summary><p>The service layer: <code>OrderValidationService.validate</code>. Pydantic only checks that the currency string is exactly three characters.</p></details>
+  <details><summary>Why is <code>SettingsDependency</code> an <code>Annotated</code> alias?</summary><p>It preserves <code>Settings</code> as the real type while attaching <code>Depends(get_settings)</code> metadata once for reuse.</p></details>
+  <details><summary>Where does the request ID live during the request?</summary><p>In the ASGI scope's <code>state</code> dictionary, surfaced by FastAPI as <code>request.state.request_id</code>.</p></details>
+  <details><summary>Why use a response model when the service already returns <code>OrderResponse</code>?</summary><p>It enforces the HTTP boundary, generates an OpenAPI schema, serializes supported types, and filters unexpected fields even if a replacement service returns extra data.</p></details>
+
+  <h2>Your tangible win</h2>
+  <p>Without looking above, say this sequence aloud:</p>
+  <pre>middleware → route → input model → dependencies → service → response model → middleware</pre>
+  <p>Then locate each step in the <a href="../reference/fastapi-app-line-by-line.html">complete line-by-line reference</a>.</p>
+
+  <footer>
+    <p>Primary reading: <a href="https://fastapi.tiangolo.com/tutorial/dependencies/">FastAPI Dependencies</a>. Ask your agent any follow-up question—even one line or one symbol at a time.</p>
+  </footer>
+</main>
+</body>
+</html>

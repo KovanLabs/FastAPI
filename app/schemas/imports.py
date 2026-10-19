@@ -13,6 +13,11 @@ class ImportResponse(BaseModel):
     state: str
 
 
+class ImportStageResponse(BaseModel):
+    import_id: str
+    state: ImportState
+
+
 class ImportStatusResponse(BaseModel):
     import_id: str
     state: ImportState
@@ -24,6 +29,9 @@ class ImportStatusResponse(BaseModel):
     updated_at: datetime
     failure_code: str | None
     failure_message: str | None
+    failed_stage: str | None
+    stage_attempt: int
+    processing_engine: str | None
 
 
 class ImportSummaryResponse(BaseModel):

@@ -1,4 +1,4 @@
-"""Coordinate one deferred JSON-array import from staging through loading."""
+"""Coordinate deferred JSON and canonical NDJSON imports."""
 
 from __future__ import annotations
 
@@ -40,12 +40,14 @@ class ImportCoordinator:
         batch_loader: BatchLoader,
         output_directory: Path,
         supported_currencies: Iterable[str],
+        progress_log_interval: int = 100_000,
     ) -> None:
         self.repository = repository
         self.adapter = adapter
         self.batch_loader = batch_loader
         self.output_directory = output_directory
         self.supported_currencies = frozenset(supported_currencies)
+        self.progress_log_interval = progress_log_interval
 
     def run(self, import_id: str, input_path: Path) -> ImportJob:
         with bind_log_context(import_id=import_id, attempt=1):
@@ -69,6 +71,8 @@ class ImportCoordinator:
                 accepted_path=accepted_path,
                 rejected_path=rejected_path,
                 supported_currencies=self.supported_currencies,
+                progress_log_interval=self.progress_log_interval,
+                maximum_record_bytes=self.adapter.maximum_record_bytes,
             )
             self._process_with_adapter(accepted_path, processed_temporary)
             os.replace(processed_temporary, processed_path)
@@ -147,7 +151,37 @@ class ImportCoordinator:
 
         try:
             job_directory.mkdir(parents=True, exist_ok=True)
-            result = self._process_with_adapter(input_path, processed_temporary)
+            logger.info(
+                "Canonical NDJSON parsing started",
+                extra={"event": "parsing.started"},
+            )
+            try:
+                result = self._process_with_adapter(
+                    input_path,
+                    processed_temporary,
+                )
+            except Exception:
+                logger.exception(
+                    "Canonical NDJSON parsing failed",
+                    extra={"event": "parsing.failed"},
+                )
+                raise
+            logger.info(
+                "Canonical NDJSON parsing completed",
+                extra={
+                    "event": "parsing.completed",
+                    "records_processed": result.records_written,
+                },
+            )
+            logger.info(
+                "Canonical NDJSON validation completed",
+                extra={
+                    "event": "validation.completed",
+                    "total_records": result.records_written,
+                    "accepted_records": result.records_written,
+                    "rejected_records": 0,
+                },
+            )
             os.replace(processed_temporary, processed_path)
             self.batch_loader.load(processed_path, import_id=import_id)
 
@@ -210,6 +244,13 @@ class ImportCoordinator:
         temporary_output_path: Path,
     ) -> AdapterResult:
         with bind_log_context(engine=self.adapter.engine):
+            logger.debug(
+                "Processing engine configuration",
+                extra={
+                    "event": "engine.configuration",
+                    "maximum_record_bytes": self.adapter.maximum_record_bytes,
+                },
+            )
             logger.info(
                 "Processing engine started",
                 extra={"event": "engine.started"},

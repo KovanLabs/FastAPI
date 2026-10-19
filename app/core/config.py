@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     import_batch_size: int = Field(default=5_000, gt=0)
     import_batch_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
     maximum_items_per_order: int = Field(default=1_000, gt=0)
+    batch_max_attempts: int = Field(default=2, ge=1, le=10)
     processing_engine: ProcessingEngine = ProcessingEngine.python
     log_level: LogLevel = LogLevel.info
     log_file_path: Path = Path("logs/application.log")

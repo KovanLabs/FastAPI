@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FastAPI Days 1 to 5 Complete Technical and Theoretical Review</title>
+  <link rel="stylesheet" href="../assets/course.css">
+  <style>
+    .day-grid { display:grid; grid-template-columns:8rem 1fr; gap:1.35rem; margin:2rem 0; }
+    .day-label { color:var(--accent); font:700 1rem/1.4 ui-sans-serif,sans-serif; }
+    .compact td:first-child { width:15rem; white-space:normal; }
+    .compact td:nth-child(2) { width:auto; }
+    .stage { font-weight:700; color:var(--accent); }
+    .question { margin:1.2rem 0; padding-left:1rem; border-left:3px solid var(--line); }
+    @media (max-width:760px) { .day-grid { grid-template-columns:1fr; gap:.2rem; } }
+  </style>
+</head>
+<body>
+<main>
+  <p class="tag">Lesson 0007 · Complete review</p>
+  <h1>FastAPI Days 1 to 5</h1>
+  <p class="lede">A technical and theoretical explanation of the Vendor Order Import API: what every layer does, why the functions exist, how a request or file moves through the system, and which parts are active, standalone, legacy, or still awaiting orchestration.</p>
+
+  <h2>The whole project in one picture</h2>
+  <div class="flow">HTTP request
+→ FastAPI route and declared HTTP contract
+→ Pydantic request schema or UploadFile
+→ dependency-built service / bounded upload storage
+→ format parser
+→ deterministic cleaner
+→ Pydantic record validation
+→ business validation
+→ import-wide duplicate decision in SQLite
+→ accepted.ndjson + rejected.ndjson + reconciled summary</div>
+  <p>Days 1–5 do not build this entire arrow as one HTTP operation. Days 1–4 build and expose the API, upload, and parser boundaries. Day 5 builds the canonical processing engine as a standalone file pipeline called by <code>scripts/process_orders.py</code>. Connecting that engine to an import job is later orchestration work.</p>
+
+  <h2>The five boundaries to remember</h2>
+  <table class="compact">
+    <thead><tr><th>Boundary</th><th>Theoretical meaning</th><th>Project example</th></tr></thead>
+    <tbody>
+      <tr><td>HTTP contract</td><td>Where input comes from, which status is returned, and what public output is allowed.</td><td>FastAPI decorators, function parameters, and <code>response_model</code>.</td></tr>
+      <tr><td>Upload storage</td><td>Receive bytes safely without assuming they are already parsed records.</td><td><code>store_upload()</code> reads chunks, hashes, limits, and atomically publishes a file.</td></tr>
+      <tr><td>Parsing</td><td>Turn bytes into JSON values and identify syntax or encoding failures.</td><td><code>iter_ndjson()</code>, <code>iter_json_array()</code>, and <code>iter_ijson_array()</code>.</td></tr>
+      <tr><td>Data quality</td><td>Normalize approved representations, validate schema, then apply business policy.</td><td><code>clean_order()</code>, <code>TypeAdapter(OrderCreate)</code>, and currency checks.</td></tr>
+      <tr><td>Import decision</td><td>Make whole-import choices, write exactly one outcome per source record, and reconcile totals.</td><td>SQLite winner index and accepted/rejected NDJSON publication.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Day 1 — FastAPI and HTTP contracts</h2>
+  <section class="day-grid">
+    <div class="day-label">Theory</div>
+    <div>
+      <p>An API contract states the method, path, input location, input schema, success status, response schema, and failure behavior. FastAPI reads a route function signature to decide whether data comes from the path, query string, dependency graph, request body, or uploaded form data.</p>
+      <p>Pydantic provides structural validation: types, required fields, length/range constraints, nested objects, enums, email syntax, decimal conversion, and datetime parsing. A business rule is different. “Currency is a three-character string” is schema validation; “only INR, USD, and EUR are supported” is business policy.</p>
+      <p>A response model is not documentation only. FastAPI serializes and filters the returned object through it, so undeclared internal fields do not become public accidentally.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Schemas</div>
+    <div>
+      <p><a href="../app/schemas/orders.py"><code>app/schemas/orders.py</code></a> declares the vocabulary of an order.</p>
+      <ul>
+        <li><code>OrderStatus</code> is a string enum. Only <code>pending</code>, <code>completed</code>, and <code>cancelled</code> are accepted.</li>
+        <li><code>Sku</code> is an <code>Annotated</code> string with whitespace stripping and length constraints.</li>
+        <li><code>OrderItem</code> requires a SKU and an integer quantity from 1 through 10,000.</li>
+        <li><code>OrderCreate</code> is the canonical incoming order shape: ID, validated email, positive <code>Decimal</code>, three-character currency, datetime, status, and at least one nested item.</li>
+        <li><code>ShippingAddress</code> and <code>CheckoutOrderRequest</code> demonstrate nested request models.</li>
+        <li><code>OrderResponse</code> inherits every <code>OrderCreate</code> field and adds <code>accepted=True</code>.</li>
+      </ul>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Route functions</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>liveness()</code></td><td>Returns <code>{"status":"ok"}</code>. It answers “is this process alive?” and deliberately avoids checking dependencies.</td></tr>
+          <tr><td><code>readiness(settings)</code></td><td>Checks that upload/output paths exist, are directories, and have a write permission bit. It answers “can this instance serve its storage-dependent work?” The mode-bit check is useful but is not a guaranteed write test.</td></tr>
+          <tr><td><code>create_order(order)</code></td><td>Rejects an existing ID, converts the validated input into <code>OrderResponse</code>, stores it in the in-memory <code>ORDERS</code> dictionary, and returns HTTP 201. This is learning CRUD state, not durable production storage.</td></tr>
+          <tr><td><code>validate_order(order, service)</code></td><td>Delegates business validation to an injected service and returns HTTP 200. The route owns HTTP; the service owns policy.</td></tr>
+          <tr><td><code>get_order(order_id)</code></td><td>Reads a path parameter, returns the order, or raises a stable 404 application error.</td></tr>
+          <tr><td><code>list_orders(order_status)</code></td><td>Reads the optional query parameter named <code>status</code>; returns all values or a filtered list.</td></tr>
+          <tr><td><code>create_checkout_order(payload)</code></td><td>Echoes a validated nested body. It demonstrates request parsing and response serialization, not checkout persistence.</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Evidence:</strong> the Day 1 record reports 20 focused tests covering the canonical body, path/query/header locations, response filtering, errors, and OpenAPI.</p>
+    </div>
+  </section>
+
+  <h2>Day 2 — Application structure, dependencies, and execution</h2>
+  <section class="day-grid">
+    <div class="day-label">Architecture</div>
+    <div>
+      <p>The folders separate reasons to change:</p>
+      <ul>
+        <li><code>app/main.py</code> assembles the application and cross-cutting behavior.</li>
+        <li><code>app/api/</code> owns HTTP routes and FastAPI dependency wiring.</li>
+        <li><code>app/schemas/</code> owns public data shapes.</li>
+        <li><code>app/services/</code> owns framework-independent business operations.</li>
+        <li><code>app/core/</code> owns configuration, errors, files, parsing, cleaning, and processing infrastructure.</li>
+      </ul>
+      <p>This structure matters because HTTP, configuration, policy, and file processing have different tests and change at different rates.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Configuration and DI</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Construct</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>Settings</code></td><td>A typed <code>BaseSettings</code> object with defaults for directories, byte limits, chunk sizes, batches, telemetry, and currencies. <code>env_prefix="APP_"</code> maps environment values such as <code>APP_MAXIMUM_UPLOAD_BYTES</code>.</td></tr>
+          <tr><td><code>get_settings()</code></td><td>Constructs settings once per process through <code>@lru_cache</code>. Tests can clear or override this boundary.</td></tr>
+          <tr><td><code>SettingsDependency</code></td><td>An <code>Annotated</code> alias meaning “this parameter has type <code>Settings</code>, and FastAPI obtains it with <code>Depends(get_settings)</code>.”</td></tr>
+          <tr><td><code>get_order_validation_service(settings)</code></td><td>Builds the service from configuration. This is the composition point between framework-managed dependencies and plain Python business code.</td></tr>
+          <tr><td><code>OrderValidationServiceDependency</code></td><td>A reusable dependency alias for route signatures.</td></tr>
+          <tr><td><code>OrderValidationService.__init__()</code></td><td>Copies supported currencies into an immutable <code>frozenset</code> for fast membership checks and protection against later mutation.</td></tr>
+          <tr><td><code>OrderValidationService.validate()</code></td><td>Raises <code>UnsupportedCurrencyError</code> when policy fails; otherwise creates the public response. It can be unit-tested without FastAPI.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">App lifecycle</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / method</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>lifespan(app)</code></td><td>Runs once at startup, loads settings, creates upload/output directories, then yields control to the server. Code before <code>yield</code> is startup; code after it would be shutdown.</td></tr>
+          <tr><td><code>RequestContextMiddleware.__init__()</code></td><td>Stores the next ASGI application in the middleware chain.</td></tr>
+          <tr><td><code>RequestContextMiddleware.__call__()</code></td><td>Passes non-HTTP scopes through. For HTTP it reads or generates a request ID, stores it in request state, starts a monotonic timer, wraps the ASGI <code>send</code> callable, and adds <code>X-Request-ID</code> and <code>X-Process-Time</code> to the response-start event.</td></tr>
+          <tr><td><code>application_error_handler()</code></td><td>Converts every <code>ApplicationError</code> subclass into one stable JSON envelope containing code, message, safe details, and request ID.</td></tr>
+          <tr><td><code>ensure_storage_directories()</code></td><td>Creates and checks both storage directories. It is a reusable helper but is currently not called by <code>lifespan()</code>, which directly creates the paths.</td></tr>
+        </tbody>
+      </table>
+      <p><strong><code>def</code> versus <code>async def</code>:</strong> ordinary route functions can be run by FastAPI in a worker thread. An async route runs on the event-loop thread and must not perform long blocking work directly. The Day 2 experiment showed two blocking sleeps taking about 0.305 seconds versus two awaited sleeps taking about 0.154 seconds.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Exceptions</div>
+    <div>
+      <p><code>ApplicationError</code> stores a stable <code>error_code</code>, HTTP <code>status_code</code>, human message, and structured details. Subclasses specialize the public meaning: upload too large (413), empty upload (400), storage failure (503), unsupported media type (415), unsupported currency (422), duplicate order (409), missing order/import (404), and unavailable storage (503). Central handling prevents every route from rebuilding error JSON.</p>
+    </div>
+  </section>
+
+  <h2>Day 3 — Receiving large uploads safely</h2>
+  <section class="day-grid">
+    <div class="day-label">Theory</div>
+    <div>
+      <p><code>UploadFile</code> represents one multipart file field. It is not parsed JSON. The upload stage must verify media type, enforce the real byte limit while reading, avoid trusting a client filename, clean up partial data, and return a stable source identity.</p>
+      <p>Bounded reading means each call asks for at most a configured chunk. It does not mean total memory is automatically bounded everywhere; later stages must also avoid retaining the entire dataset.</p>
+      <p>Writing to a temporary file and replacing the final path only after success gives a publication boundary: readers never mistake a partially written file for a completed upload. <code>os.replace()</code> is atomic for one destination on the same filesystem.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Functions</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / type</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>ImportResult</code></td><td>An immutable dataclass returning import ID, SHA-256 checksum, safe stored filename, and byte count.</td></tr>
+          <tr><td><code>AsyncReadable</code></td><td>A protocol requiring only async <code>read(size)</code>. This keeps <code>store_upload()</code> decoupled from FastAPI's concrete <code>UploadFile</code> and makes fakes easy in tests.</td></tr>
+          <tr><td><code>store_upload(source, settings, suffix)</code></td><td>Generates a UUID identity and server-owned path; opens a unique <code>.part</code> file; repeatedly reads configured chunks; rejects a chunk that would exceed the total limit; writes through <code>asyncio.to_thread()</code>; updates SHA-256 in the same pass; rejects empty input; atomically replaces the final path; removes the temporary file for size, empty, I/O, cancellation, or other failure; returns metadata only after success.</td></tr>
+          <tr><td><code>import_orders(settings, file)</code></td><td>Normalizes the MIME type, maps supported types to approved suffixes, stores the bytes, and returns HTTP 202 with state <code>queued</code>. It intentionally does not parse or process the file.</td></tr>
+        </tbody>
+      </table>
+      <p><strong>Why hash during the copy?</strong> The bytes already pass through the loop, so one pass supplies integrity/source identity without rereading or retaining the file.</p>
+      <p><strong>Evidence:</strong> 12 upload tests passed. In the recorded experiment, whole reads scaled from roughly 16 to 64 MiB, while 1 MiB chunked reads stayed near 2 MiB of traced Python allocations.</p>
+    </div>
+  </section>
+
+  <h2>Day 4 — Incremental JSON parsing</h2>
+  <section class="day-grid">
+    <div class="day-label">Theory</div>
+    <div>
+      <p><strong>NDJSON</strong> contains one complete JSON value per physical line. A bad line can be rejected and parsing can resume at the next line. A <strong>JSON array</strong> is one document; element boundaries depend on commas, nesting, string literals, and escapes. Broken structural syntax can invalidate the remainder.</p>
+      <p>An iterator or generator is lazy: it can produce one result before all results exist. But streaming is an end-to-end property. <code>list(iterator)</code> retains every yielded object and eliminates the main memory advantage.</p>
+      <p>A parser checks bytes, UTF-8, and JSON syntax. It does not automatically enforce the order schema or business rules.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">NDJSON</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / type</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>ParseOutcome</code></td><td>Represents exactly one physical line as a parsed object, an error code, or a skipped blank. The line number provides audit location.</td></tr>
+          <tr><td><code>iter_ndjson()</code></td><td>Uses bounded <code>readline(maximum + 2)</code>; separates LF/CRLF; drains the rest of an oversized physical line; decodes strict UTF-8; classifies blank, invalid UTF-8, invalid JSON, and non-object input; yields an outcome and continues where recovery is safe.</td></tr>
+          <tr><td><code>summarize_ndjson()</code></td><td>Consumes outcomes one at a time, counts every category, but retains only a configured number of failure samples.</td></tr>
+          <tr><td><code>summarize_ndjson_file()</code></td><td>Opens a path in binary mode and delegates to the stream-oriented summarizer.</td></tr>
+          <tr><td><code>validate_ndjson_import()</code></td><td>Checks the endpoint-specific MIME contract, stores the upload, moves synchronous parsing to a thread with <code>asyncio.to_thread()</code>, and builds the public summary response.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">JSON array</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / method</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>iter_file_chunks()</code></td><td>Reads a binary source in fixed-size chunks and rejects a non-positive chunk size.</td></tr>
+          <tr><td><code>iter_json_array()</code></td><td>Feeds chunks into a stateful element parser, yields complete values immediately, and calls <code>finish()</code> to verify end-of-document structure.</td></tr>
+          <tr><td><code>_IncrementalArrayParser.__init__()</code></td><td>Initializes the byte buffer and state needed across chunk boundaries: current grammar state, element start, nesting depth, string mode, and escape mode.</td></tr>
+          <tr><td><code>feed()</code></td><td>Appends bytes and returns any newly completed elements.</td></tr>
+          <tr><td><code>finish()</code></td><td>Performs the final scan and rejects a missing top-level array, incomplete element, or missing closing bracket.</td></tr>
+          <tr><td><code>_scan()</code></td><td>Implements the state machine: requires <code>[</code>, distinguishes first/required elements, separators, end, strings, escapes, and nested structures; compacts the processed buffer while retaining an incomplete element.</td></tr>
+          <tr><td><code>_emit()</code></td><td>Extracts one complete byte slice, checks size, parses it with <code>json.loads()</code>, and resets element state.</td></tr>
+          <tr><td><code>_check_size()</code></td><td>Raises <code>RecordTooLargeError</code> before one array element grows beyond policy.</td></tr>
+          <tr><td><code>summarize_json_array()</code></td><td>Enumerates streamed elements, counts objects as syntactically valid records, classifies other JSON values as <code>not_object</code>, and bounds samples.</td></tr>
+          <tr><td><code>summarize_json_array_file()</code></td><td>File-opening wrapper around the stream summarizer.</td></tr>
+          <tr><td><code>validate_json_array_import()</code></td><td>Stores a JSON upload, runs synchronous parsing in a thread, and returns the parse-level summary.</td></tr>
+        </tbody>
+      </table>
+      <p><code>RecordTooLargeError</code> is HTTP 413; <code>InvalidJsonError</code> is HTTP 400. These parser errors inherit the common application error contract.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Experiments</div>
+    <div>
+      <p><code>make_order()</code> creates one deterministic generated record with controlled anomalies. <code>write_orders()</code> streams a valid top-level array to disk instead of building it in memory. The script <code>main()</code> parses CLI arguments and writes the fixture.</p>
+      <p><code>custom_records()</code> yields through the custom array parser; <code>ijson_records()</code> yields through <code>ijson.items()</code>; <code>consume()</code> either counts lazily or deliberately materializes with <code>list()</code>; the comparison <code>main()</code> measures elapsed time and process peak RSS.</p>
+      <p>For 100,000 records: <code>json.load()</code> peaked at 162.37 MiB, lazy custom parsing at 18.28 MiB, lazy ijson at 18.29 MiB, and materialized incremental iterators around 175–178 MiB. Ten million ijson records were counted at 18.51 MiB peak RSS on the recorded machine. These are machine-specific measurements; the general result is the retention behavior.</p>
+      <p><code>stream_items()</code> in <code>app/day-04_sample.py</code> demonstrates an <em>outgoing</em> async iterable response. It does not parse an uploaded file. Direction and format must not be confused.</p>
+    </div>
+  </section>
+
+  <h2>Day 5 — Cleaning, validation, duplicates, and rejection handling</h2>
+  <section class="day-grid">
+    <div class="day-label">Theory</div>
+    <div>
+      <p>Day 5 separates four questions:</p>
+      <ol>
+        <li><span class="stage">Cleaning:</span> which approved source representations become one canonical representation?</li>
+        <li><span class="stage">Schema validation:</span> does the cleaned value satisfy <code>OrderCreate</code>?</li>
+        <li><span class="stage">Business validation:</span> is the otherwise valid order allowed by current policy?</li>
+        <li><span class="stage">Import decision:</span> which valid duplicate wins, and what output receives every source record?</li>
+      </ol>
+      <p>A deterministic cleaner gives the same result for the same input. An idempotent cleaner satisfies <code>clean(clean(x)) == clean(x)</code> for accepted values. Stable machine codes are project-owned; human messages may change without breaking clients. Nested locations such as <code>("items", 0, "sku")</code> preserve exactly where a problem occurred.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Cleaning functions</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / type</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>CleaningIssue</code></td><td>Immutable stable code, structured field location, and human message.</td></tr>
+          <tr><td><code>CleaningResult</code></td><td>Returns the canonical partial value plus every issue found, rather than throwing at the first field.</td></tr>
+          <tr><td><code>clean_order()</code></td><td>Deep-copies the input so cleaning cannot mutate caller data, cleans each known field in a fixed order, omits unknown fields, and returns immutable issues.</td></tr>
+          <tr><td><code>_clean_text_field()</code></td><td>Distinguishes missing, null, wrong type, and blank. Otherwise trims and applies the passed transformation: uppercasing IDs/currencies, lowercasing emails/statuses.</td></tr>
+          <tr><td><code>_clean_amount()</code></td><td>Rejects missing/null/blank/bool/non-numeric/non-finite/non-positive values; converts via <code>Decimal</code>; rounds to two places with explicit <code>ROUND_HALF_UP</code> under a sufficient precision context.</td></tr>
+          <tr><td><code>_clean_datetime()</code></td><td>Accepts a datetime or ISO string. A naive value is interpreted in Asia/Kolkata; an aware value is converted to Asia/Kolkata.</td></tr>
+          <tr><td><code>_clean_items()</code></td><td>Requires a non-empty list, validates that each member is an object, and delegates nested fields while retaining list indexes in issue locations.</td></tr>
+          <tr><td><code>_clean_item_sku()</code></td><td>Requires a nonblank string and trims it.</td></tr>
+          <tr><td><code>_clean_item_quantity()</code></td><td>Requires the exact Python type <code>int</code> and range 1–10,000. Using <code>type(raw) is int</code> intentionally rejects booleans, because <code>bool</code> is an <code>int</code> subclass.</td></tr>
+          <tr><td><code>_issue()</code></td><td>Small constructor that keeps issue creation uniform.</td></tr>
+        </tbody>
+      </table>
+      <p>The private <code>_MISSING</code> sentinel is necessary because <code>dict.get()</code> must distinguish an absent key from a present key whose JSON value is <code>null</code>.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Pipeline functions</div>
+    <div>
+      <table class="compact">
+        <thead><tr><th>Function / type</th><th>What it does and why</th></tr></thead>
+        <tbody>
+          <tr><td><code>ValidationIssue</code></td><td>Common internal representation of a business/schema issue location, message, and error type.</td></tr>
+          <tr><td><code>OrderImportSummary.__post_init__()</code></td><td>Enforces the invariant <code>total = accepted + rejected</code>. A completed summary cannot represent unreconciled counts.</td></tr>
+          <tr><td><code>validate_order_business()</code></td><td>Normalizes configured currency names and applies project policy after schema validation.</td></tr>
+          <tr><td><code>_business_issues()</code></td><td>Returns no issues for a supported currency or a structured <code>unsupported_currency</code> issue.</td></tr>
+          <tr><td><code>process_order_file()</code></td><td>The Day 5 orchestrator. Validates arguments, creates output parents, reuses one <code>TypeAdapter(OrderCreate)</code>, creates a temporary SQLite file, stages every decision, publishes outputs, measures SQLite footprint, always deletes the working database, and returns the reconciled summary.</td></tr>
+          <tr><td><code>_create_import_tables()</code></td><td>Creates <code>records</code> for every source decision and <code>winners</code> for the latest valid record number per canonical order ID.</td></tr>
+          <tr><td><code>_stage_order_records()</code></td><td>Pass one: streams ijson values; rejects non-objects; cleans; validates with Pydantic; applies business policy; serializes accepted/rejected decisions; inserts each record; upserts only valid IDs into <code>winners</code>; commits at a configured interval.</td></tr>
+          <tr><td><code>_publish_order_outputs()</code></td><td>Pass two: joins records to winners in source order. Pre-existing failures go to rejected; the winner goes to accepted; earlier valid duplicates become <code>duplicate_order_id</code>. It updates exact counters and bounded samples, flushes, and <code>fsync()</code>s both temporary outputs.</td></tr>
+          <tr><td><code>_temporary_output_path()</code></td><td>Safely reserves a unique temporary pathname beside its destination, then removes the placeholder so exclusive output creation can use it.</td></tr>
+          <tr><td><code>_publish_output_pair()</code></td><td>Backs up existing outputs, replaces both one at a time, and restores the previous pair after an ordinary publication exception. Each replace is atomic; two paths cannot be perfectly pair-atomic across sudden process or machine failure.</td></tr>
+          <tr><td><code>_temporary_backup_path()</code></td><td>Creates a collision-resistant backup name beside a destination.</td></tr>
+          <tr><td><code>_accepted_json()</code></td><td>Builds the canonical accepted envelope with source record number and Pydantic-serialized order.</td></tr>
+          <tr><td><code>_schema_rejection_json()</code></td><td>Maps Pydantic errors to stable project messages/codes while preserving nested <code>loc</code> segments.</td></tr>
+          <tr><td><code>_schema_issue_code()</code></td><td>Maps a field path to a stable project code such as <code>invalid_email</code> or <code>invalid_quantity</code>.</td></tr>
+          <tr><td><code>_rejection_json()</code></td><td>Serializes either cleaning or business issues into one public rejection envelope.</td></tr>
+          <tr><td><code>_json_text()</code></td><td>Produces compact deterministic UTF-8-friendly JSON text.</td></tr>
+          <tr><td><code>_write_ndjson_line()</code></td><td>Writes exactly one compact JSON value followed by one newline.</td></tr>
+          <tr><td><code>_record_failure()</code></td><td>Counts all failures by code but appends only up to the configured sample limit.</td></tr>
+          <tr><td><code>_sqlite_size_bytes()</code></td><td>Multiplies SQLite page count by page size to report the logical working-store footprint.</td></tr>
+          <tr><td><code>iter_ijson_array()</code></td><td>Verifies that the first event is a top-level array, lazily yields <code>item</code> values, and translates ijson failures into the project error family.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">Duplicate policy</div>
+    <div>
+      <p>The policy is <strong>last valid record wins within one import</strong>. Invalid records never update the winners table, so a later invalid duplicate cannot displace an earlier valid order. A later valid duplicate replaces the winner row; during pass two, every earlier valid occurrence is rejected.</p>
+      <p>Why SQLite instead of a Python set? The measured peak for 100,000 generated IDs was about 114 bytes per ID, projecting roughly 1.14 GB of traced Python heap for 10 million IDs, before other pipeline memory. SQLite moves import-wide state to a bounded disk-backed working store.</p>
+    </div>
+  </section>
+  <section class="day-grid">
+    <div class="day-label">CLI and evidence</div>
+    <div>
+      <p><code>scripts/process_orders.py:main()</code> loads settings, parses input/output/commit/sample arguments, calls <code>process_order_file()</code>, and prints the summary with elapsed time and process peak RSS.</p>
+      <p><code>measure_duplicate_index()</code> validates a positive count, forces garbage collection, measures a generated Python set with <code>tracemalloc</code>, verifies uniqueness, computes bytes per ID, and projects the 10-million-ID peak. Its <code>main()</code> exposes the experiment as a CLI.</p>
+      <p><strong>Evidence:</strong> the Day 5 record reports 80 focused tests covering cleaning cases, half-up rounding, strict quantities, timezone normalization, idempotence, non-mutation, nested errors, extras, duplicate scope, invalid duplicates, business rejection, byte-identical reruns, output rollback, reconciled counts, bounded samples, and golden files.</p>
+    </div>
+  </section>
+
+  <h2>Legacy and out-of-scope code you should identify correctly</h2>
+  <table class="compact">
+    <thead><tr><th>Code</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td><code>iter_batches()</code></td><td>A correct generic bounded-batch helper, retained with the older Day 4/benchmark path.</td></tr>
+      <tr><td><code>clean_order_batch()</code>, <code>iter_order_outcomes()</code>, <code>summarize_order_file()</code>, <code>_string_series()</code>, <code>_amount_text()</code></td><td>Explicitly labeled legacy Day 4 Polars benchmark code. It does not implement the canonical Day 5 contract and must not be confused with <code>process_order_file()</code>.</td></tr>
+      <tr><td><code>processing_adapters.py</code> and <code>inspect_polars_adapter.py</code></td><td>Day 6 processing-engine seam and inspection work. They are beyond the requested Day 5 scope.</td></tr>
+      <tr><td><code>POST /imports</code></td><td>Active upload route, but currently returns <code>queued</code> without scheduling <code>process_order_file()</code>.</td></tr>
+      <tr><td><code>/imports/ndjson/validate</code> and <code>/imports/json/validate</code></td><td>Active parse-level validation endpoints. “Valid record” there means a syntactically valid JSON object, not a cleaned and business-approved <code>OrderCreate</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>A source record traced end to end</h2>
+  <pre>{
+  "order_id": " ord-1001 ",
+  "customer_email": "USER@EXAMPLE.COM ",
+  "amount": "12.345",
+  "currency": " inr ",
+  "ordered_at": "2026-10-07T10:30:00+00:00",
+  "status": "PENDING",
+  "items": [{"sku": " sku-1 ", "quantity": 2}]
+}</pre>
+  <ol>
+    <li>The JSON-array parser yields a Python dictionary without loading the full array.</li>
+    <li>The cleaner produces <code>ORD-1001</code>, lowercase email, <code>Decimal("12.35")</code>, <code>INR</code>, an Asia/Kolkata-aware datetime, <code>pending</code>, and trimmed SKU.</li>
+    <li><code>TypeAdapter(OrderCreate)</code> confirms the canonical schema and nested constraints.</li>
+    <li>Business validation confirms that INR is configured as supported.</li>
+    <li>SQLite records this valid record and makes its canonical ID the current winner.</li>
+    <li>After all records are seen, pass two writes it to accepted output only if no later valid record with the same canonical ID exists.</li>
+  </ol>
+
+  <h2>Core theoretical lessons</h2>
+  <ol>
+    <li><strong>Validation is layered.</strong> JSON syntax, Pydantic schema, business policy, and duplicate policy answer different questions.</li>
+    <li><strong>Bounded memory is end to end.</strong> Chunked upload or lazy parsing alone is insufficient if a later consumer builds a full list or set.</li>
+    <li><strong>Recovery needs a trustworthy boundary.</strong> NDJSON has a physical line boundary; a malformed array may not.</li>
+    <li><strong>Stable contracts belong to the application.</strong> Public error codes and canonical output must not depend directly on changeable library wording.</li>
+    <li><strong>Correctness precedes acceleration.</strong> Day 5 freezes a standard-Python golden result before alternative engines are compared.</li>
+    <li><strong>Durability has levels.</strong> Temporary write plus replace protects one file; rollback improves a two-file normal-failure case; neither creates a database-grade distributed transaction.</li>
+    <li><strong>Measurements need scope.</strong> <code>tracemalloc</code> measures traced Python allocations; RSS includes more process memory. Results from one machine are evidence, not universal guarantees.</li>
+  </ol>
+
+  <h2>Retrieval practice</h2>
+  <div class="question"><strong>1.</strong> Why is unsupported currency not expressed only as <code>Field(min_length=3, max_length=3)</code>?</div>
+  <div class="question"><strong>2.</strong> What does <code>response_model</code> protect in addition to generating OpenAPI documentation?</div>
+  <div class="question"><strong>3.</strong> Why can <code>async def</code> still block the entire event-loop thread?</div>
+  <div class="question"><strong>4.</strong> Why does the upload service use a generated filename and a <code>.part</code> file?</div>
+  <div class="question"><strong>5.</strong> Why can NDJSON continue after malformed JSON more safely than one top-level array?</div>
+  <div class="question"><strong>6.</strong> Why does <code>list(ijson.items(...))</code> defeat the intended memory behavior?</div>
+  <div class="question"><strong>7.</strong> What is the difference between missing, null, and blank, and how does <code>_MISSING</code> preserve it?</div>
+  <div class="question"><strong>8.</strong> Why does the Day 5 duplicate algorithm need two passes?</div>
+  <div class="question"><strong>9.</strong> Why does a later invalid duplicate not displace an earlier valid record?</div>
+  <div class="question"><strong>10.</strong> Which HTTP endpoint currently runs the full Day 5 pipeline? Explain the current integration boundary.</div>
+
+  <h2>Primary references</h2>
+  <ul>
+    <li><a href="https://fastapi.tiangolo.com/tutorial/dependencies/">FastAPI dependencies</a></li>
+    <li><a href="https://fastapi.tiangolo.com/advanced/events/">FastAPI lifespan events</a></li>
+    <li><a href="https://fastapi.tiangolo.com/tutorial/request-files/">FastAPI request files</a></li>
+    <li><a href="https://fastapi.tiangolo.com/tutorial/response-model/">FastAPI response models</a></li>
+    <li><a href="https://docs.pydantic.dev/latest/concepts/models/">Pydantic models</a></li>
+    <li><a href="https://docs.pydantic.dev/latest/errors/errors/">Pydantic error details</a></li>
+    <li><a href="https://docs.pydantic.dev/latest/concepts/type_adapter/">Pydantic TypeAdapter</a></li>
+    <li><a href="https://docs.python.org/3/library/decimal.html">Python decimal</a></li>
+    <li><a href="https://docs.python.org/3/library/sqlite3.html">Python sqlite3</a></li>
+    <li><a href="https://github.com/ICRAR/ijson">ijson incremental parsing</a></li>
+  </ul>
+
+  <footer>Use this as a review map, then answer the retrieval questions without reopening it. Ask your teacher to quiz you one question at a time or to explain any function line by line.</footer>
+</main>
+</body>
+</html>

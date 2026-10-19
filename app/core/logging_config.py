@@ -38,6 +38,14 @@ _SAFE_EVENT_FIELDS = (
     "batches_skipped",
     "import_state",
     "retryable",
+    "reason",
+    "maximum_bytes",
+    "bytes_received",
+    "upload_chunk_bytes",
+    "checksum_sha256",
+    "maximum_record_bytes",
+    "next_attempt",
+    "database_status",
 )
 
 
@@ -118,7 +126,10 @@ class JsonFormatter(logging.Formatter):
         }
         for field in _SAFE_EVENT_FIELDS:
             if hasattr(record, field):
-                payload[field] = getattr(record, field)
+                value = getattr(record, field)
+                payload[field] = (
+                    _redact_message(value) if isinstance(value, str) else value
+                )
         if record.exc_info is not None:
             exception_type, _, exception_traceback = record.exc_info
             if exception_type is not None and exception_traceback is not None:
